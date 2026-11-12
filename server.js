@@ -1,0 +1,154 @@
+'use strict';
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+const express = require('express');
+const { Server } = require('socket.io');
+const { Room, GameError, CONFIG, validateConfig } = require('./game');
+const { loadCards } = require('./server/cards');
+
+process.on('uncaughtException', e => console.error('[uncaught]', e));
+process.on('unhandledRejection', e => console.error('[unhandled]', e));
+
+// R-3-01
+const cfgErrors = validateConfig(CONFIG);
+if (cfgErrors.length) { cfgErrors.forEach(e => console.error('[config] ' + e)); process.exit(1); }
+
+const CARDS_DIR = path.join(__dirname, 'cards');
+const CARDS = loadCards(CARDS_DIR, CONFIG);
+console.log(CARDS.ready ? `[cards] โหลด ${CARDS.cards.length} ใบ version ${CARDS.version}` : `[cards] ไม่พร้อม: ${CARDS.problem}`);
+
+const app = express();
+app.disable('x-powered-by');
+app.get('/healthz', (req, res) => res.type('text').send('ok'));
+app.get('/api/cards', (req, res) => res.json({ version: CARDS.version, templates: CARDS.templates, cards: CARDS.cards }));
+app.get('/preview', (req, res) => res.sendFile(path.join(__dirname, 'public', 'preview.html')));
+app.use('/cards', express.static(CARDS_DIR, { maxAge: '30d' }));
+app.use('/shared', express.static(path.join(__dirname, 'shared')));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
+
+const server = http.createServer(app);
+const io = new Server(server, { maxHttpBufferSize: 1e5 });
+
+const rooms = new Map();           // code -> Room
+const sockRoom = new Map();        // socket.id -> { code, pid }
+
+function newCode() {
+  for (;;) {
+    let c = '';
+    for (let i = 0; i < CONFIG.ROOM_CODE_LEN; i++) c += CONFIG.ROOM_CODE_CHARS[crypto.randomInt(CONFIG.ROOM_CODE_CHARS.length)];
+    if (!rooms.has(c)) return c;
+  }
+}
+const logEvent = e => console.log(JSON.stringify(e)); // หัวข้อ 12: event log ไม่มี token
+
+const pending = new Set();
+function scheduleBroadcast(room) {
+  if (pending.has(room)) return;
+  pending.add(room);
+  setImmediate(() => {
+    pending.delete(room);
+    try { broadcast(room); } catch (e) { console.error('[broadcast]', e); }
+  });
+}
+function broadcast(room) {
+  for (const [sid, info] of sockRoom) {
+    if (info.code !== room.code) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (s && room.seat(info.pid)) s.emit('state', room.getState(info.pid));
+  }
+}
+function socketsOf(code, pid) {
+  return [...sockRoom.entries()].filter(([, v]) => v.code === code && v.pid === pid).map(([sid]) => sid);
+}
+function attach(socket, room, pid) {
+  // R-8-05 socket ใหม่แทนที่ socket เก่าของที่นั่งเดียวกัน
+  for (const sid of socketsOf(room.code, pid)) {
+    if (sid === socket.id) continue;
+    const old = io.sockets.sockets.get(sid);
+    sockRoom.delete(sid);
+    if (old) { old.emit('replaced'); old.disconnect(true); }
+  }
+  sockRoom.set(socket.id, { code: room.code, pid });
+  room.setConnected(pid, true);
+}
+function detach(socket) {
+  const info = sockRoom.get(socket.id);
+  if (!info) return;
+  sockRoom.delete(socket.id);
+  const room = rooms.get(info.code);
+  if (room && !socketsOf(info.code, info.pid).length) { room.setConnected(info.pid, false); scheduleBroadcast(room); }
+}
+
+function safe(ack, fn) {
+  const reply = typeof ack === 'function' ? ack : () => {};
+  try { reply({ ok: true, ...(fn() || {}) }); }
+  catch (e) {
+    if (e instanceof GameError) reply({ ok: false, code: e.code, reason: e.reason, error: e.message });
+    else { console.error('[handler]', e); reply({ ok: false, code: 'SERVER', error: 'เกิดข้อผิดพลาด ลองใหม่อีกครั้ง' }); }
+  }
+}
+const notReady = () => new GameError('CARDS_NOT_READY', 'ข้อมูลการ์ดไม่พร้อม');
+const obj = p => (p && typeof p === 'object' ? p : {});
+
+io.on('connection', socket => {
+  socket.on('create', (p, ack) => safe(ack, () => {
+    if (!CARDS.ready) throw notReady();                    // R-5-01
+    const code = newCode();
+    const room = new Room(code, { cards: CARDS.cards, onLog: logEvent });
+    const { pid, token } = room.addPlayer(obj(p).name);
+    rooms.set(code, room);
+    detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    return { code, pid, token };
+  }));
+  socket.on('join', (p, ack) => safe(ack, () => {
+    const code = String(obj(p).code || '').trim().toUpperCase().slice(0, 10);
+    const room = rooms.get(code);
+    if (!room) throw new GameError('ROOM_NOT_FOUND', 'ไม่พบห้องนี้');   // R-5-04
+    const { pid, token } = room.addPlayer(obj(p).name);
+    detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    return { code, pid, token };
+  }));
+  socket.on('resume', (p, ack) => safe(ack, () => {
+    const code = String(obj(p).code || '').toUpperCase().slice(0, 10);
+    const room = rooms.get(code);
+    if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่'); // R-8-10
+    const pid = room.resume(obj(p).token);
+    detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    return { code, pid };
+  }));
+  socket.on('leave', (p, ack) => safe(ack, () => {
+    const info = sockRoom.get(socket.id);
+    if (!info) return {};
+    const room = rooms.get(info.code);
+    for (const sid of socketsOf(info.code, info.pid)) sockRoom.delete(sid);
+    if (room) { room.leave(info.pid); scheduleBroadcast(room); }
+    return {};
+  }));
+  socket.on('action', (p, ack) => safe(ack, () => {
+    const info = sockRoom.get(socket.id);
+    const room = info && rooms.get(info.code);
+    if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่');
+    const r = room.action(info.pid, p);
+    scheduleBroadcast(room);
+    return r && r.placement !== undefined ? { placement: r.placement } : {};
+  }));
+  socket.on('disconnect', () => { try { detach(socket); } catch (e) { console.error('[disconnect]', e); } });
+});
+
+// งานเบื้องหลัง: เวลาเฟส การหลุด และลบห้องร้าง (R-8-01..R-8-04, R-8-09)
+setInterval(() => {
+  for (const [code, room] of rooms) {
+    try {
+      if (room.tick()) scheduleBroadcast(room);
+      if (room.expired()) {
+        rooms.delete(code);
+        for (const [sid, v] of sockRoom) if (v.code === code) sockRoom.delete(sid);
+        logEvent({ t: Date.now(), room: code, type: 'room_closed' });
+      }
+    } catch (e) { console.error('[tick]', code, e); }
+  }
+}, 500);
+
+const PORT = Number(process.env.PORT) || 3000;
+server.listen(PORT, () => console.log(`Battle Weed: Green Social พร้อมที่พอร์ต ${PORT}`));

@@ -1,0 +1,11 @@
+.ck-card{position:relative;container-type:inline-size;width:100%;overflow:hidden;user-select:none}
+.ck-full{width:min(92vw,420px)} .ck-thumb{min-width:110px}
+.ck-art{position:absolute;overflow:hidden;display:flex;align-items:center;justify-content:center;text-align:center;font-size:6cqw}
+.ck-art img{width:100%;height:100%;object-fit:cover;display:block}
+.ck-frame,.ck-layer{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.ck-cssframe{border:1cqw solid #555;border-radius:3cqw;box-sizing:border-box}
+.ck-slot{position:absolute;box-sizing:border-box}
+.ck-text,.ck-badge{display:flex;flex-direction:column;line-height:1.15}
+.ck-shrink span{white-space:nowrap}
+.ck-pips{display:flex}.ck-pips i{display:block;border-radius:50%}
+.ck-preview [data-overflow]{outline:3px solid #E5533D}
