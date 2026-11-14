@@ -221,7 +221,8 @@
         let inner = '';
         if (a && t < a.mid) { cls.push('aimed'); inner = TARGET; st = null; }
         else if (a && t < a.end) cls.push('burn');
-        if (st) { cls.push('s-' + st); inner = STATE_SVG[st] || ''; }
+        if (st && o.sunkCells && o.sunkCells.has(k) && (st === 'hit' || st === 'island_hit')) cls.push('s-sunk', st === 'island_hit' ? 's-island' : 'x');
+        else if (st) { cls.push('s-' + st); inner = STATE_SVG[st] || ''; }
         else if (!inner) cls.push('s-unshot');
         if (o.islands && o.islands.has(k) && !st) cls.push('myisl');
         if (o.traps && o.traps.has(k) && !st) { cls.push('s-trap', 'reveal'); inner = STATE_SVG.trap; }
@@ -259,20 +260,17 @@
       if (!set.has(kk(r, c - 1))) sides.push('border-left'); if (!set.has(kk(r, c + 1))) sides.push('border-right');
       h += `<div class="oline" style="left:${c * cs}px;top:${r * cs}px;width:${cs}px;height:${cs}px;${sides.map(s => `${s}:3px solid ${ol.color}`).join(';')}"></div>`;
     }
-    const rs = ol.cells.map(x => x[0]), cs2 = ol.cells.map(x => x[1]);
-    const cy = (Math.min(...rs) + Math.max(...rs) + 1) / 2, cx = (Math.min(...cs2) + Math.max(...cs2) + 1) / 2;
-    const sz = Math.min(cs * 1.6, 44);
-    h += `<button class="othumb" data-act="sunkview" data-owner="${esc(ol.owner)}" data-piece="${esc(ol.pieceId)}" style="left:${cx * cs - sz / 2}px;top:${cy * cs - sz / 2}px;width:${sz}px;height:${sz}px;border-color:${ol.color}" aria-label="${esc(piece(ol.pieceId).name)}"><img src="${artURL(ol.pieceId)}" alt="" onerror="this.remove()"></button>`;
     return h;
   }
-  function sunkLayers(owners) { // ชิ้นที่ดับ: ภาพเต็มช่วงเฉลย แล้วเหลือเส้นขอบ
-    const pieces = [], outlines = []; const t = Date.now();
+  function sunkLayers(owners) { // ชิ้นที่ดับ: ภาพเต็มชัดค้างไว้ + กรอบสีเจ้าของ ไม่มีรอยไหม้ในช่องของชิ้น
+    const pieces = [], outlines = [], cells = new Set(); const t = Date.now();
     for (const p of owners) for (const s of p.sunk) {
       const until = S.reveal.get(`${p.pid}:${s.pieceId}`);
-      if (until && until > t) pieces.push({ pieceId: s.pieceId, row: s.row, col: s.col, rot: s.rot, cls: 'revealing' });
-      else outlines.push({ cells: s.cells, color: p.color, pieceId: s.pieceId, owner: p.pid });
+      pieces.push({ pieceId: s.pieceId, row: s.row, col: s.col, rot: s.rot, cls: until && until > t ? 'sunkimg revealing' : 'sunkimg' });
+      outlines.push({ cells: s.cells, color: p.color, pieceId: s.pieceId, owner: p.pid });
+      s.cells.forEach(([r, c]) => cells.add(kk(r, c)));
     }
-    return { pieces, outlines };
+    return { pieces, outlines, cells };
   }
   const cellsMap = board => { const b = S.st.boards.find(x => x.id === board); return new Map(b ? b.cells.map(([r, c, v]) => [kk(r, c), v]) : []); };
 
@@ -450,17 +448,17 @@
       if (S.tab === 'me') {
         const sl = sunkLayers([m]);
         boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: m.pid, cells: cellsMap(m.pid), islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
-          pieces: [...(m.placement || []).filter(p => !m.sunk.some(s => s.pieceId === p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines })}`;
+          pieces: [...(m.placement || []).filter(p => !m.sunk.some(s => s.pieceId === p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines, sunkCells: sl.cells })}`;
       } else {
         const o = pl(S.tab); const sl = sunkLayers([o]);
-        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: o.pid, cells: cellsMap(o.pid), marks, pieces: sl.pieces, outlines: sl.outlines,
+        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: o.pid, cells: cellsMap(o.pid), marks, pieces: sl.pieces, outlines: sl.outlines, sunkCells: sl.cells,
           clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) })}`;
       }
     } else {
       const sl = sunkLayers(st.players);
       const mySunk = new Set(m.sunk.map(s => s.pieceId));
       boardBlock = boardHTML({ board: '*', cells: cellsMap('*'), marks, islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
-        pieces: [...(m.placement || []).filter(p => !mySunk.has(p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines,
+        pieces: [...(m.placement || []).filter(p => !mySunk.has(p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines, sunkCells: sl.cells,
         clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) });
     }
     const n = needShots();
@@ -490,6 +488,8 @@
     const classic = S.st.settings.mode === 'classic';
     const all = S.st.players.filter(p => p.placement);
     const outlinesOf = p => (p.placement || []).map(pp => ({ cells: absCells(pp), color: p.color, pieceId: pp.pieceId, owner: p.pid }));
+    const imgsOf = p => (p.placement || []).map(pp => ({ ...pp, cls: p.sunk.some(s => s.pieceId === pp.pieceId) ? 'sunkimg' : 'reveal' }));
+    const sunkSet = ps => new Set(ps.flatMap(p => p.sunk.flatMap(s => s.cells.map(([r, c]) => kk(r, c)))));
     let boards;
     if (classic) {
       if (!S.tab || S.tab === 'me' || !all.some(p => p.pid === S.tab)) S.tab = (all.find(p => p.pid !== m.pid) || m).pid;
@@ -497,11 +497,11 @@
       const bd = S.st.boards.find(b => b.id === o.pid);
       boards = `<div class="tabs">${all.map(p => `<button class="tab ${S.tab === p.pid ? 'on' : ''}" data-act="tab" data-id="${esc(p.pid)}">${dot(p)}${esc(p.name)}</button>`).join('')}</div>
         ${boardHTML({ board: o.pid, cells: cellsMap(o.pid), islands: new Set((o.islands || []).flat().map(([r, c]) => kk(r, c))), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
-          pieces: (o.placement || []).map(p => ({ ...p, cls: 'reveal' })), outlines: outlinesOf(o) })}`;
+          pieces: imgsOf(o), outlines: outlinesOf(o), sunkCells: sunkSet([o]) })}`;
     } else {
       const bd = S.st.boards.find(b => b.id === '*');
       boards = boardHTML({ board: '*', cells: cellsMap('*'), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
-        islands: new Set(all.flatMap(p => (p.islands || []).flat().map(([r, c]) => kk(r, c)))), outlines: all.flatMap(outlinesOf) });
+        islands: new Set(all.flatMap(p => (p.islands || []).flat().map(([r, c]) => kk(r, c)))), pieces: all.flatMap(imgsOf), outlines: all.flatMap(outlinesOf), sunkCells: sunkSet(all) });
     }
     const act2 = S.st.players.filter(p => !p.removed);
     const waiting = act2.filter(p => !p.wantsRematch).map(p => p.name);
@@ -610,7 +610,6 @@
       }
       case 'zoom': S.zoom = Math.min(3, Math.max(1, S.zoom + (+el.dataset.v) * 0.5)); return render();
       case 'sumtoggle': S.sumOpen = !S.sumOpen; return render();
-      case 'sunkview': S.modal = { type: 'sunk', owner: el.dataset.owner, piece: el.dataset.piece }; return render();
       case 'resign': S.modal = { type: 'resign' }; return render();
       case 'resign-yes': S.modal = null; await act('resign'); return render();
       case 'close': S.modal = null; return render();
