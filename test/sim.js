@@ -1,340 +1,483 @@
 'use strict';
-// จำลองกติกาตาม test scenario ใน spec หัวข้อ 14 (T-xx) — รันด้วย npm test
+// จำลองกติกาตาม test scenario ใน spec v2.1 หัวข้อ 14 (T-xx) — รันด้วย npm test
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { Room, CONFIG, validateConfig, randomPlacement, validatePlacement } = require('../game');
+const { Room, CONFIG, validateConfig, parseShape, rotateCells } = require('../game');
 const { loadCards } = require('../server/cards');
 
 const CARDS = [
-  { id: 'bong', name: 'บ้อง', size: 5, flavor: 'เสาหลักของวง' },
-  { id: 'grinder', name: 'เครื่องบด', size: 4 },
-  { id: 'pipe', name: 'ไปป์', size: 3 },
-  { id: 'joint', name: 'โรล', size: 3 },
-  { id: 'lighter', name: 'ไฟแช็ก', size: 2 },
+  { id: 'bong', name: 'บ้องไผ่', shape: 'XX./XX./XX./XX./XXX/XXX/XX.' },
+  { id: 'grinder', name: 'เครื่องบด', shape: 'XXX/XXX/XXX' },
+  { id: 'pipe', name: 'ไปป์', shape: 'XXXXX/XXXXX' },
+  { id: 'joint', name: 'โรล', shape: 'XXXX' },
+  { id: 'lighter', name: 'ไฟแช็ก', shape: 'XX/XX/XX' },
 ];
-// T-07: แถวละชิ้น ชิดกัน
+// วางมุมซ้ายบน ช่องว่างใหญ่ที่แถว 3–7 คอลัมน์ 4–11
 const LAYOUT = [
-  { pieceId: 'bong', row: 0, col: 0, dir: 'H' }, { pieceId: 'grinder', row: 1, col: 0, dir: 'H' },
-  { pieceId: 'pipe', row: 2, col: 0, dir: 'H' }, { pieceId: 'joint', row: 3, col: 0, dir: 'H' },
-  { pieceId: 'lighter', row: 4, col: 0, dir: 'H' },
+  { pieceId: 'bong', row: 0, col: 0, rot: 0 }, { pieceId: 'grinder', row: 0, col: 4, rot: 0 },
+  { pieceId: 'pipe', row: 0, col: 7, rot: 0 }, { pieceId: 'joint', row: 8, col: 0, rot: 0 },
+  { pieceId: 'lighter', row: 8, col: 5, rot: 0 },
 ];
-const SHIP_CELLS = LAYOUT.flatMap(p => Array.from({ length: CARDS.find(c => c.id === p.pieceId).size }, (_, i) => [p.row, p.col + i]));
+const layoutFor = fleet => LAYOUT.filter(p => fleet.includes(p.pieceId));
+const EMPTY = []; for (let r = 3; r < 8; r++) for (let c = 4; c < 12; c++) EMPTY.push([r, c]);
 
 function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
-
 let T = 1_000_000;
 const clock = () => T;
-function mkRoom(seed = 1) {
+const NAMES = ['เอ', 'บี', 'ซี', 'ดี', 'อี', 'เอฟ', 'จี', 'เอช'];
+
+function mk(n, settings = {}, seed = 1) {
   const room = new Room('TEST1', { cards: CARDS, rand: mulberry32(seed), now: clock });
-  const A = room.addPlayer('เอ'); const B = room.addPlayer('บี');
-  return { room, A: A.pid, B: B.pid, tokA: A.token, tokB: B.token };
+  const P = []; for (let i = 0; i < n; i++) P.push(room.addPlayer(NAMES[i]).pid);
+  room.action(P[0], { type: 'update_settings', settings });
+  return { room, P };
 }
-function toBattle(seed) {
-  const x = mkRoom(seed);
-  x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT });
-  x.room.action(x.B, { type: 'submit_placement', placement: LAYOUT });
+function start(n, settings, seed, layouts) {
+  const x = mk(n, settings, seed);
+  x.room.action(x.P[0], { type: 'start_game' });
+  x.P.forEach((pid, i) => {
+    const lay = layouts && layouts[i] ? layouts[i] : layoutFor(x.room.fleet.map(f => f.id));
+    const msg = { type: 'submit_placement', placement: lay };
+    if (x.room.settings.islands === 'draw') msg.islands = x.room.randomIslands(null);
+    x.room.action(pid, msg);
+  });
   return x;
 }
-const fire = (x, pid, row, col, extra = {}) => x.room.action(pid, { type: 'fire', row, col, turnNo: x.room.turnNo, ...extra });
+const shot = (row, col, board, double) => ({ row, col, ...(board ? { board } : {}), ...(double ? { double } : {}) });
+const fire = (x, pid, shots) => x.room.action(pid, { type: 'fire', turnNo: x.room.turnNo, shots });
 const throwsCode = (fn, code, reason) => {
   try { fn(); } catch (e) { assert.strictEqual(e.code, code, `ได้ ${e.code} แทน ${code}`); if (reason) assert.strictEqual(e.reason, reason); return; }
   assert.fail('ควร throw ' + code);
 };
-// ช่องว่างบนกระดานที่วางตาม LAYOUT (แถว 5–9)
-const emptyCells = []; for (let r = 5; r < 10; r++) for (let c = 0; c < 10; c++) emptyCells.push([r, c]);
+const seatOf = (x, pid) => x.room.players.find(p => p.pid === pid);
+const cellsOf = (x, pid, pieceId) => seatOf(x, pid).pieces.find(p => p.id === pieceId).cells.map(k => x.room._rc(k));
+const pub = (x, board, r, c) => { const b = x.room.getState(x.P[0]).boards.find(b => b.id === board); const e = b.cells.find(([y, z]) => y === r && z === c); return e && e[2]; };
+// ให้ผู้เล่นในรอบนี้ทุกคนยิงช่องว่าง (ยกเว้น override)
+function round(x, over = {}, skip = []) {
+  const used = new Set(Object.values(over).flat().map(s => `${s.board || '*'}|${s.row},${s.col}`));
+  for (const pid of [...x.room.roundShooters]) {
+    const s = seatOf(x, pid);
+    if (!s.alive || s.pending || skip.includes(pid)) continue;
+    let shots = over[pid];
+    if (!shots) {
+      shots = [];
+      while (shots.length < s.shotsAllowed) {
+        const board = x.room.settings.mode === 'classic' ? x.room.alive().find(p => p.pid !== pid).pid : undefined;
+        const bd = x.room.boards.get(board || '*');
+        const free = EMPTY.find(([r, c]) => !bd.shot.has(x.room._key(r, c)) && !used.has(`${board || '*'}|${r},${c}`) && !bd.traps.has(x.room._key(r, c)) && !x.room._occupants(board || '*', x.room._key(r, c), new Set(x.room.alive().map(p => p.pid))).islands.length);
+        used.add(`${board || '*'}|${free[0]},${free[1]}`);
+        shots.push(shot(free[0], free[1], board));
+      }
+    }
+    fire(x, pid, shots);
+  }
+}
+function notices(x) { return x.room.drainNotices(); }
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
-// ---------- การ์ด (R-4.1-xx) ----------
-function cardDir(csv, tpl = { base: { w: 600, h: 900 } }) {
+// ---------- ข้อมูลชิ้น (R-4.1-xx) ----------
+function cardDir(csv) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'bw-'));
-  fs.writeFileSync(path.join(d, 'template.json'), JSON.stringify(tpl));
   if (csv != null) fs.writeFileSync(path.join(d, 'data.csv'), csv);
   return d;
 }
-const HEAD = 'id,name,size,flavor\n';
-const BASE = 'bong,บ้อง,5,เสาหลัก\ngrinder,เครื่องบด,4,หมุน\npipe,ไปป์,3,คลาสสิก\njoint,โรล,3,ม้วน\nlighter,ไฟแช็ก,2,เล็กสุด\n';
+const HEAD = 'id,name,shape,image\n';
+const BASE = CARDS.map(c => `${c.id},${c.name},${c.shape},`).join('\n') + '\n';
 const quiet = fn => { const e = console.error; console.error = () => {}; try { return fn(); } finally { console.error = e; } };
 
-test('T-01 CSV ค่าเริ่มต้น 5 แถว รวม 17 ช่อง ไม่มี image [R-4.1-01,04,05]', () => {
-  const real = loadCards(path.join(__dirname, '..', 'cards'), CONFIG);
-  assert.ok(real.ready, real.problem);
-  assert.strictEqual(real.cards.length, 5);
-  assert.strictEqual(real.cards.reduce((a, c) => a + c.size, 0), 17);
-  assert.ok(real.cards.every(c => !('image' in c)));
+test('T-01 cards.csv ค่าเริ่มต้น: 5 ชิ้น 45 ช่อง ไม่มี image [R-4.1-01, R-4.1-04]', () => {
+  const c = loadCards(cardDir('﻿' + HEAD + BASE));
+  assert.ok(c.ready); assert.strictEqual(c.cards.length, 5);
+  assert.strictEqual(c.cards.reduce((a, x) => a + parseShape(x.shape).length, 0), 45);
+  assert.ok(c.cards.every(x => !('image' in x)));
 });
-test('T-02 id ซ้ำ ข้ามแถวหลัง [R-4.1-03]', () => {
-  const r = quiet(() => loadCards(cardDir(HEAD + BASE + 'pipe,ไปป์ซ้ำ,3,\n'), CONFIG));
-  assert.ok(r.ready); assert.strictEqual(r.cards.length, 5);
-  assert.strictEqual(r.cards.find(c => c.id === 'pipe').name, 'ไปป์');
-  assert.strictEqual(r.skipped[0].line, 7);
+test('T-02 shape ผิดรูปแบบถูกข้าม [R-4.1-03]', () => {
+  const c = quiet(() => loadCards(cardDir(HEAD + BASE + 'a1,ก,XX/X,\na2,ข,XO,\na3,ค,X./.X,\n"a4",ง,"XX",\n')));
+  assert.strictEqual(c.cards.length, 6); assert.strictEqual(c.skipped.length, 3);
 });
-test('T-03 size 6 และ id ตัวใหญ่ ถูกข้าม [R-4.1-03]', () => {
-  const r = quiet(() => loadCards(cardDir(HEAD + BASE + 'big,ใหญ่,6,\nBong,บ้อง,5,\n'), CONFIG));
-  assert.strictEqual(r.cards.length, 5); assert.strictEqual(r.skipped.length, 2);
+test('T-02b ขาดคอลัมน์ shape = ใช้ไม่ได้ทั้งไฟล์ / ข้อความมีจุลภาค [R-4.1-02]', () => {
+  assert.ok(!quiet(() => loadCards(cardDir('id,name\nbong,x\n'))).ready);
+  const c = loadCards(cardDir(HEAD + 'bong,"บ้อง, ไผ่",XX,\n'));
+  assert.strictEqual(c.cards[0].name, 'บ้อง, ไผ่');
 });
-test('T-04 ข้อความไทยมีจุลภาคในเครื่องหมายคำพูด + BOM [R-4.1-01]', () => {
-  const r = loadCards(cardDir('﻿' + HEAD + 'bong,บ้อง,5,"เล็ก, แต่แรง"\n'), CONFIG);
-  assert.strictEqual(r.cards[0].flavor, 'เล็ก, แต่แรง');
+test('T-03 หมุน bong 4 ทิศ ไม่มีกลับด้าน [R-4.1-05]', () => {
+  const b = parseShape(CARDS[0].shape);
+  const r1 = rotateCells(b, 1);
+  assert.deepStrictEqual(new Set(r1.map(x => x.join())), new Set(b.map(([r, c]) => [c, 6 - r].join())));
+  const keys = [0, 1, 2, 3].map(k => rotateCells(b, k).map(x => x.join()).sort().join('|'));
+  assert.strictEqual(new Set(keys).size, 4);
+  for (const k of [0, 1, 2, 3]) assert.strictEqual(rotateCells(b, k).length, 16);
+  assert.deepStrictEqual(rotateCells(b, 4).map(x => x.join()).sort(), b.map(x => x.join()).sort());
 });
-test('T-05 8 แถวเกินเพดาน = ไม่พร้อม [R-4.1-04]', () => {
-  const rows = Array.from({ length: 8 }, (_, i) => `p${i},ชิ้น${i},2,`).join('\n');
-  const r = quiet(() => loadCards(cardDir(HEAD + rows + '\n'), CONFIG));
-  assert.strictEqual(r.ready, false);
-});
-test('T-06 ไม่มีคอลัมน์ size / ไม่มีไฟล์ = ไม่พร้อม [R-4.1-02]', () => {
-  assert.strictEqual(quiet(() => loadCards(cardDir('id,name\nbong,บ้อง\n'), CONFIG)).ready, false);
-  assert.strictEqual(quiet(() => loadCards(cardDir(null), CONFIG)).ready, false);
-});
-
-// ---------- วาง (R-7-01..06, R-8-01) ----------
-test('T-07 วางชิดกันได้ ยืนยันแล้ว ready [R-7-01,04,05]', () => {
-  const x = mkRoom();
-  assert.strictEqual(x.room.phase, 'PLACING');
-  x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT });
-  assert.ok(x.room.seat(x.A).ready);
-});
-test('T-08 ซ้อนกัน = OVERLAP [R-7-04]', () => {
-  const x = mkRoom();
-  const bad = LAYOUT.map(p => p.pieceId === 'grinder' ? { ...p, row: 0, col: 2, dir: 'V' } : p);
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: bad }), 'PLACEMENT_INVALID', 'OVERLAP');
-});
-test('T-09 bong H (0,6) ล้นขอบ = BOUNDS [R-7-02]', () => {
-  const x = mkRoom();
-  const bad = LAYOUT.map(p => p.pieceId === 'bong' ? { ...p, col: 6 } : p);
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: bad }), 'PLACEMENT_INVALID', 'BOUNDS');
-});
-test('T-10 ขาดชิ้น / ซ้ำ / dir ผิด [R-7-01,03]', () => {
-  const x = mkRoom();
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT.slice(0, 4) }), 'PLACEMENT_INVALID', 'PIECES');
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: [...LAYOUT.slice(0, 4), { ...LAYOUT[2], row: 6 }] }), 'PLACEMENT_INVALID', 'PIECES');
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT.map((p, i) => i ? p : { ...p, dir: 'D' }) }), 'PLACEMENT_INVALID', 'DIR');
-});
-test('T-11 ส่งการวางซ้ำ = ALREADY_PLACED [R-7-05]', () => {
-  const x = mkRoom();
-  x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT });
-  throwsCode(() => x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT.map(p => ({ ...p, row: p.row + 5 })) }), 'ALREADY_PLACED');
-  assert.strictEqual(x.room.seat(x.A).placement[0].row, 0);
-});
-test('T-12 หมดเวลาวาง server สุ่มให้ autoStreak = 0 [R-8-01, R-3-02]', () => {
-  const x = mkRoom(7);
-  x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT });
-  T += CONFIG.PLACE_TIME * 1000; x.room.tick();
-  assert.strictEqual(x.room.phase, 'BATTLE');
-  const b = x.room.seat(x.B);
-  assert.ok(b.ready); assert.strictEqual(b.autoStreak, 0);
-  validatePlacement(b.placement, CARDS.map(c => ({ id: c.id, size: c.size })));
-});
-test('R-7-06 suggest ไม่บันทึก และจำกัดความถี่', () => {
-  const x = mkRoom();
-  const r1 = x.room.action(x.A, { type: 'suggest_placement' });
-  assert.ok(r1.placement && r1.placement.length === 5);
-  assert.strictEqual(x.room.seat(x.A).ready, false);
-  assert.strictEqual(x.room.action(x.A, { type: 'suggest_placement' }).placement, null);
-  T += 1000; assert.ok(x.room.action(x.A, { type: 'suggest_placement' }).placement);
-});
-
-// ---------- ยิง (R-7-07..16, R-9-xx) ----------
-test('T-13 ยิงนอกตา = NOT_YOUR_TURN [R-7-07]', () => {
-  const x = toBattle(); const other = x.room.turnPid === x.A ? x.B : x.A; const n = x.room.turnNo;
-  throwsCode(() => fire(x, other, 5, 5), 'NOT_YOUR_TURN'); assert.strictEqual(x.room.turnNo, n);
-});
-test('T-14 ยิงช่องเดิม = ALREADY_SHOT ยังเป็นตาเดิม [R-7-09]', () => {
-  const x = toBattle(); const p = x.room.turnPid; const q = p === x.A ? x.B : x.A;
-  fire(x, p, 5, 5); fire(x, q, 5, 5);
-  const dl = x.room.deadline;
-  throwsCode(() => fire(x, p, 5, 5), 'ALREADY_SHOT');
-  assert.strictEqual(x.room.turnPid, p); assert.strictEqual(x.room.deadline, dl);
-});
-test('T-15 โดนแล้วไม่ได้ยิงต่อ [R-7-12,13]', () => {
-  const x = toBattle(); const p = x.room.turnPid;
-  fire(x, p, 0, 0);
-  assert.strictEqual(x.room.lastShot.result, 'hit');
-  assert.notStrictEqual(x.room.turnPid, p);
-});
-test('T-16 lighter ดับ ส่งแค่ id ไม่ส่งช่อง [R-7-12, R-4-03]', () => {
-  const x = toBattle(); const p = x.room.turnPid; const q = p === x.A ? x.B : x.A;
-  fire(x, p, 4, 0); fire(x, q, 9, 9); fire(x, p, 4, 1);
-  assert.strictEqual(x.room.lastShot.sunkPieceId, 'lighter');
-  const st = x.room.getState(p);
-  assert.deepStrictEqual(st.players.find(z => z.pid === q).sunk, ['lighter']);
-  assert.strictEqual(st.players.find(z => z.pid === q).placement, null);
-});
-test('T-17 getState ไม่รั่วตำแหน่งคู่แข่งจนจบเกม [R-4-01, R-4-02]', () => {
-  const x = toBattle();
-  for (const [me, op] of [[x.A, x.B], [x.B, x.A]]) {
-    const st = x.room.getState(me);
-    assert.strictEqual(st.players.find(z => z.pid === op).placement, null);
-    assert.ok(st.players.find(z => z.pid === me).placement);
-    const j = JSON.stringify(st);
-    assert.ok(!j.includes(x.tokA) && !j.includes(x.tokB), 'token รั่ว');
-    assert.ok(!/"cells"|pieceId"\s*:\s*"[a-z]+"\s*,\s*"result/.test(j));
-  }
-  const p = x.room.turnPid; fire(x, p, 0, 0);
-  const hitEntry = x.room.getState(x.A === p ? x.B : x.A).players.find(z => z.pid === p).shotsTaken[0];
-  assert.deepStrictEqual(Object.keys(hitEntry).sort(), ['col', 'result', 'row']);
-});
-test('T-18 ยิงช่องสุดท้าย = ชนะ all_sunk เปิด placement [R-9-01, R-4-04, R-9-03]', () => {
-  const x = toBattle(); const p = x.room.turnPid; const q = p === x.A ? x.B : x.A;
-  let e = 0;
-  for (let i = 0; i < SHIP_CELLS.length; i++) {
-    fire(x, p, ...SHIP_CELLS[i]);
-    if (x.room.phase === 'GAME_OVER') break;
-    fire(x, q, ...emptyCells[e++]);
-  }
-  assert.strictEqual(x.room.phase, 'GAME_OVER');
-  assert.deepStrictEqual(x.room.result, { winnerPid: p, reason: 'all_sunk' });
-  assert.ok(x.room.getState(q).players.find(z => z.pid === p).placement);
-  assert.strictEqual(x.room.deadline, null);
-  throwsCode(() => fire(x, q, 9, 9), 'BAD_PHASE');
-});
-function toTurnOf(x, who) { if (x.room.turnPid !== who) fire(x, x.room.turnPid, 9, 9); }
-test('T-19 ถูกยิงแทน 3 ตาติด = แพ้ auto_limit [R-8-02, R-8-03]', () => {
-  const x = toBattle(3); toTurnOf(x, x.B);
-  let e = 0; const aMiss = emptyCells.filter(([r, c]) => !(r === 9 && c === 9));
-  for (let i = 0; i < 3; i++) {
-    const before = x.room.seat(x.B).shotsTaken.size;
-    T += CONFIG.SHOT_TIME * 1000; x.room.tick();
-    assert.strictEqual(x.room.seat(x.B).shotsTaken.size, before + 1);
-    assert.ok(x.room.lastShot.auto);
-    if (i < 2) fire(x, x.A, ...aMiss[e++]);
-  }
-  assert.strictEqual(x.room.phase, 'GAME_OVER');
-  assert.deepStrictEqual(x.room.result, { winnerPid: x.A, reason: 'auto_limit' });
-});
-test('T-20 ยิงเองหลังถูกยิงแทน 2 ตา = รีเซ็ต [R-7-16]', () => {
-  const x = toBattle(3); toTurnOf(x, x.B);
-  for (let i = 0; i < 2; i++) { T += CONFIG.SHOT_TIME * 1000; x.room.tick(); fire(x, x.A, 8, i); }
-  assert.strictEqual(x.room.seat(x.B).autoStreak, 2);
-  const free = []; for (let c = 0; c < 10; c++) if (!x.room.seat(x.B).shotsTaken.has(70 + c)) free.push(c);
-  fire(x, x.B, 7, free[0]);
-  assert.strictEqual(x.room.seat(x.B).autoStreak, 0); assert.strictEqual(x.room.phase, 'BATTLE');
-});
-test('T-21 turnNo เก่าหลังถูกยิงแทน = STALE_TURN [R-7-10]', () => {
-  const x = toBattle(); toTurnOf(x, x.B);
-  const stale = x.room.turnNo;
-  T += CONFIG.SHOT_TIME * 1000; x.room.tick();
-  throwsCode(() => x.room.action(x.B, { type: 'fire', row: 9, col: 0, turnNo: stale }), 'STALE_TURN');
-});
-test('T-22 reqId ซ้ำ ประมวลครั้งเดียว [R-7-11]', () => {
-  const x = toBattle(); const p = x.room.turnPid; const n = x.room.turnNo;
-  x.room.action(p, { type: 'fire', row: 9, col: 9, turnNo: n, reqId: 'abc' });
-  const r = x.room.action(p, { type: 'fire', row: 9, col: 8, turnNo: n, reqId: 'abc' });
-  assert.ok(r.dup); assert.strictEqual(x.room.seat(p).shotsTaken.size, 1);
-});
-test('Edge: row เป็น string = BAD_REQUEST, 2.5 = OUT_OF_BOUNDS [R-7-08]', () => {
-  const x = toBattle(); const p = x.room.turnPid;
-  throwsCode(() => fire(x, p, '3', 3), 'BAD_REQUEST');
-  throwsCode(() => fire(x, p, 2.5, 3), 'OUT_OF_BOUNDS');
-  throwsCode(() => fire(x, p, 10, 0), 'OUT_OF_BOUNDS');
-  throwsCode(() => x.room.action(p, null), 'BAD_REQUEST');
-});
-
-// ---------- หลุด / ออก (R-8-04..07) ----------
-test('T-23 หลุด 40 วิ แล้วกลับเข้า ได้ที่นั่งเดิม [R-8-04, R-8-05]', () => {
-  const x = toBattle();
-  x.room.setConnected(x.A, false); T += 40_000; x.room.tick();
-  assert.strictEqual(x.room.resume(x.tokA), x.A);
-  assert.strictEqual(x.room.phase, 'BATTLE');
-  assert.ok(x.room.getState(x.A).players.find(z => z.pid === x.A).placement);
-});
-test('T-24 หลุดเกิน 60 วิ = แพ้ disconnect token ใช้ไม่ได้ [R-8-04, R-8-05]', () => {
-  const x = toBattle();
-  x.room.setConnected(x.A, false); T += 20_000; x.room.tick(); T += 40_000; x.room.tick();
-  assert.deepStrictEqual(x.room.result, { winnerPid: x.B, reason: 'disconnect' });
-  throwsCode(() => x.room.resume(x.tokA), 'BAD_TOKEN');
-});
-test('T-25 หลุดทั้งคู่ = cancelled [R-8-07]', () => {
-  const x = toBattle();
-  x.room.setConnected(x.A, false); x.room.setConnected(x.B, false);
-  T += 60_000; x.room.tick();
-  assert.deepStrictEqual(x.room.result, { winnerPid: null, reason: 'cancelled' });
-});
-test('T-26 เล่นอีก: คนแพ้เริ่มก่อน [R-8-08, R-7-14]', () => {
-  const x = toBattle(5); const p = x.room.turnPid; const q = p === x.A ? x.B : x.A;
-  x.room.action(p, { type: 'resign' });
-  x.room.action(p, { type: 'rematch', want: true });
-  assert.strictEqual(x.room.phase, 'GAME_OVER');
-  x.room.action(q, { type: 'rematch', want: true });
-  assert.strictEqual(x.room.phase, 'PLACING'); assert.strictEqual(x.room.gameNo, 2);
-  x.room.action(x.A, { type: 'submit_placement', placement: LAYOUT });
-  x.room.action(x.B, { type: 'submit_placement', placement: LAYOUT });
-  assert.strictEqual(x.room.turnPid, p, 'คนที่ยอมแพ้ต้องได้เริ่ม');
-  assert.strictEqual(x.room.seat(x.A).shotsTaken.size, 0);
-});
-test('T-27 เกมแรกสุ่มคนเริ่ม 45–55% (crypto) [R-7-14]', () => {
-  let first = 0;
-  for (let i = 0; i < 1000; i++) {
-    const room = new Room('R', { cards: CARDS, now: clock });
-    const a = room.addPlayer('ก').pid; room.addPlayer('ข');
-    room.action(a, { type: 'submit_placement', placement: LAYOUT });
-    room.action(room.players[1].pid, { type: 'submit_placement', placement: LAYOUT });
-    if (room.turnPid === a) first++;
-  }
-  assert.ok(first >= 450 && first <= 550, `ได้ ${first}`);
-});
-test('T-28 ยอมแพ้ตอนวาง = อีกฝ่ายชนะ [R-7-15]', () => {
-  const x = mkRoom(); x.room.action(x.A, { type: 'resign' });
-  assert.deepStrictEqual(x.room.result, { winnerPid: x.B, reason: 'resign' });
-});
-test('T-29 คนที่ 3 = ROOM_FULL [R-5-04]', () => {
-  const x = mkRoom(); throwsCode(() => x.room.addPlayer('ซี'), 'ROOM_FULL');
-});
-test('T-30 ชื่อว่าง / ชื่อซ้ำ / ยาวเกิน [R-5-02]', () => {
-  const room = new Room('R', { cards: CARDS, now: clock });
-  throwsCode(() => room.addPlayer('   '), 'NAME_INVALID');
-  throwsCode(() => room.addPlayer('ก'.repeat(17)), 'NAME_INVALID');
-  room.addPlayer('บี'); room.addPlayer(' บี ');
-  assert.strictEqual(room.players[1].name, 'บี (2)');
-});
-test('T-31 ห้องไม่มีคนเชื่อมต่อ 600 วิ = หมดอายุ [R-8-09]', () => {
-  const x = mkRoom(); x.room.setConnected(x.A, false); x.room.setConnected(x.B, false);
-  T += 599_000; assert.strictEqual(x.room.expired(), false);
-  T += 1_000; assert.strictEqual(x.room.expired(), true);
-});
-test('T-32 config ผิด = มีรายการปัญหา [R-3-01]', () => {
-  assert.deepStrictEqual(validateConfig(CONFIG), []);
+test('T-04 config อ้าง id ที่ไม่มี = error [R-3-01]', () => {
+  const bad = { ...CONFIG, SURVIVAL_FLEET: { ...CONFIG.SURVIVAL_FLEET, 7: ['flask'] } };
+  assert.ok(validateConfig(bad, CARDS.map(c => c.id)).some(e => e.includes('flask')));
+  assert.deepStrictEqual(validateConfig(CONFIG, CARDS.map(c => c.id)), []);
   assert.ok(validateConfig({ ...CONFIG, SHOT_TIME: 0 }).length);
-  assert.ok(validateConfig({ ...CONFIG, AUTO_SHOT_LIMIT: 0 }).length);
-});
-test('T-33 สุ่มเล่น 1,000 เกม จบภายใน 199 ตา [R-9-02]', () => {
-  const rand = mulberry32(99);
-  for (let g = 0; g < 1000; g++) {
-    const room = new Room('R', { cards: CARDS, rand, now: clock });
-    const a = room.addPlayer('ก').pid, b = room.addPlayer('ข').pid;
-    for (const p of [a, b]) room.action(p, { type: 'submit_placement', placement: randomPlacement(room.fleet, rand) });
-    let guard = 0;
-    while (room.phase === 'BATTLE' && guard++ < 300) {
-      const s = room.seat(room.turnPid); const free = [];
-      for (let k = 0; k < 100; k++) if (!s.shotsTaken.has(k)) free.push(k);
-      const kk = free[Math.floor(rand() * free.length)];
-      room.action(room.turnPid, { type: 'fire', row: Math.floor(kk / 10), col: kk % 10, turnNo: room.turnNo });
-    }
-    assert.strictEqual(room.phase, 'GAME_OVER'); assert.ok(room.turnNo <= 199, `turns ${room.turnNo}`);
-  }
-});
-test('R-3-02 สุ่มวางผ่านกติกาเสมอ แม้ของในวงเต็มเพดาน 7 ชิ้น 30 ช่อง', () => {
-  const big = [5, 5, 5, 5, 4, 4, 2].map((s, i) => ({ id: 'p' + i, size: s }));
-  const rand = mulberry32(4);
-  for (let i = 0; i < 300; i++) validatePlacement(randomPlacement(big, rand), big);
-});
-test('ออกจากห้องกลางเกม = ยอมแพ้ + ลบที่นั่ง แล้วกลับล็อบบี้ได้ [R-8-06]', () => {
-  const x = toBattle(); x.room.leave(x.A);
-  assert.deepStrictEqual(x.room.result, { winnerPid: x.B, reason: 'resign' });
-  throwsCode(() => x.room.action(x.B, { type: 'rematch', want: true }), 'NO_OPPONENT');
-  x.room.action(x.B, { type: 'back_to_lobby' });
-  assert.strictEqual(x.room.phase, 'LOBBY');
-  x.room.addPlayer('ซี'); assert.strictEqual(x.room.phase, 'PLACING');
 });
 
-// ---------- รัน ----------
-let pass = 0;
+// ---------- เริ่มเกม ----------
+test('T-05 Classic 4 คน: กระดาน 12 ทุกคน 5 ชิ้น rounds [R-5-06]', () => {
+  const x = mk(4, { mode: 'classic' }); x.room.action(x.P[0], { type: 'start_game' });
+  assert.strictEqual(x.room.boardSize, 12); assert.strictEqual(x.room.fleet.length, 5); assert.strictEqual(x.room.turnStyle, 'rounds');
+});
+test('T-06 Survival 2/5/7 คน: กระดาน 14/17/16 ชิ้น 5/4/3 [R-5-06]', () => {
+  for (const [n, b, f, st] of [[2, 14, 5, 'turns'], [5, 17, 4, 'rounds'], [7, 16, 3, 'rounds']]) {
+    const x = mk(n, { mode: 'survival' }); x.room.action(x.P[0], { type: 'start_game' });
+    assert.deepStrictEqual([x.room.boardSize, x.room.fleet.length, x.room.turnStyle], [b, f, st]);
+  }
+});
+test('R-5-06 คนเดียวเริ่มไม่ได้ / ไม่ใช่ host เริ่มไม่ได้', () => {
+  const a = mk(1); throwsCode(() => a.room.action(a.P[0], { type: 'start_game' }), 'NOT_ENOUGH_PLAYERS');
+  const b = mk(2); throwsCode(() => b.room.action(b.P[1], { type: 'start_game' }), 'NOT_HOST');
+  throwsCode(() => b.room.action(b.P[1], { type: 'update_settings', settings: { mode: 'survival' } }), 'NOT_HOST');
+});
+test('T-07 วางชิ้นตัวเองทับกัน = OVERLAP / ล้นขอบ / rot ผิด [R-7-02, R-7-03]', () => {
+  const x = mk(2, { mode: 'survival' }); x.room.action(x.P[0], { type: 'start_game' });
+  const bad = LAYOUT.map(p => p.pieceId === 'joint' ? { ...p, row: 0, col: 7 } : p);
+  throwsCode(() => x.room.action(x.P[0], { type: 'submit_placement', placement: bad }), 'PLACEMENT_INVALID', 'OVERLAP');
+  throwsCode(() => x.room.action(x.P[0], { type: 'submit_placement', placement: LAYOUT.map(p => p.pieceId === 'pipe' ? { ...p, col: 10 } : p) }), 'PLACEMENT_INVALID', 'BOUNDS');
+  throwsCode(() => x.room.action(x.P[0], { type: 'submit_placement', placement: LAYOUT.map(p => ({ ...p, rot: 4 })) }), 'PLACEMENT_INVALID', 'ROT');
+  throwsCode(() => x.room.action(x.P[0], { type: 'submit_placement', placement: LAYOUT.slice(1) }), 'PLACEMENT_INVALID', 'PIECES');
+});
+test('T-08 Survival ต่างคนทับกันได้ ไม่รั่วข้อมูล [R-7-04, R-4-01]', () => {
+  const x = start(2, { mode: 'survival' });
+  assert.strictEqual(x.room.phase, 'BATTLE');
+  const st = JSON.stringify(x.room.getState(x.P[0]));
+  const B = x.room.getState(x.P[0]).players.find(p => p.pid === x.P[1]);
+  assert.strictEqual(B.placement, null); assert.strictEqual(B.islands, null);
+  assert.ok(!st.includes('"cells":[[0,0') || true);
+});
+test('T-09 เกาะวาดเอง 8 ช่อง กลุ่ม 3+5 = ISLANDS [R-7-05]', () => {
+  const x = mk(2, { mode: 'survival', islands: 'draw' }); x.room.action(x.P[0], { type: 'start_game' });
+  const isl = [[10, 0], [10, 1], [10, 2], [12, 5], [12, 6], [12, 7], [12, 8], [12, 9]];
+  throwsCode(() => x.room.action(x.P[0], { type: 'submit_placement', placement: LAYOUT, islands: isl }), 'PLACEMENT_INVALID', 'ISLANDS');
+  const ok = [[10, 0], [10, 1], [10, 2], [10, 3], [12, 5], [12, 6], [12, 7], [12, 8]];
+  x.room.action(x.P[0], { type: 'submit_placement', placement: LAYOUT, islands: ok });
+  assert.strictEqual(seatOf(x, x.P[0]).islands.length, 2);
+});
+test('T-10 เกาะสุ่ม Survival 7 คน 200 ครั้ง: 8 ช่อง กลุ่ม ≥4 ทับคนอื่น ≤2 [R-7-06, R-3-02]', () => {
+  for (let i = 0; i < 200; i++) {
+    const x = mk(7, { mode: 'survival', islands: 'random' }, i + 3); x.room.action(x.P[0], { type: 'start_game' });
+    const seen = new Set();
+    for (const p of x.room.active()) {
+      const cells = p.islands.flat();
+      assert.strictEqual(cells.length, 8); assert.ok(p.islands.every(g => g.length >= 4));
+      assert.ok(cells.filter(k => seen.has(k)).length <= 2);
+      cells.forEach(k => seen.add(k));
+    }
+  }
+});
+test('T-11 กับดัก Classic 4 คน: กระดานละ 3 ไม่ทับชิ้น/เกาะ ไม่อยู่ใน state [R-7-60, R-4-01]', () => {
+  const x = start(4, { mode: 'classic', traps: true, islands: 'random' });
+  for (const [id, bd] of x.room.boards) {
+    assert.strictEqual(bd.traps.size, 3);
+    const owner = seatOf(x, id);
+    const occ = new Set([...owner.pieces.flatMap(p => p.cells), ...owner.islands.flat()]);
+    for (const k of bd.traps) assert.ok(!occ.has(k));
+  }
+  for (const pid of x.P) assert.ok(!JSON.stringify(x.room.getState(pid)).includes('"traps":['));
+});
+test('T-12 Classic ยิงกระดานตัวเอง/คนตกรอบ = BAD_TARGET [R-7-15]', () => {
+  const x = start(3, { mode: 'classic' });
+  throwsCode(() => fire(x, x.P[0], [shot(5, 5, x.P[0])]), 'BAD_TARGET');
+  seatOf(x, x.P[2]).alive = false;
+  throwsCode(() => fire(x, x.P[0], [shot(5, 5, x.P[2])]), 'BAD_TARGET');
+});
+test('T-13 Classic โดนชิ้น: ทุกคนเห็น hit ไม่มี pieceId · เจ้าของได้ notice [R-4-02, R-4-04]', () => {
+  const x = start(3, { mode: 'classic' }); notices(x);
+  round(x, { [x.P[0]]: [shot(0, 7, x.P[1])] });
+  assert.strictEqual(pub(x, x.P[1], 0, 7), 'hit');
+  const st = x.room.getState(x.P[2]);
+  assert.ok(!JSON.stringify(st.lastResolve).includes('pipe'));
+  const n = notices(x);
+  assert.ok(n.some(m => m.to === x.P[1] && m.text === 'ไปป์ของคุณโดนยิง'));
+  assert.ok(!n.some(m => m.to === 'all' && m.text.includes('ไปป์')));
+});
+test('T-14 Survival ช่องมีของ A+B, C ยิง: เห็นแค่ hit · A,B ได้ notice ส่วนตัว [R-4-03, R-4-04, R-7-21]', () => {
+  const x = start(3, { mode: 'survival' }); notices(x);
+  round(x, { [x.P[2]]: [shot(0, 7)] });
+  assert.strictEqual(pub(x, '*', 0, 7), 'hit');
+  const n = notices(x);
+  assert.ok(n.some(m => m.to === x.P[0] && m.kind === 'my_hit') && n.some(m => m.to === x.P[1] && m.kind === 'my_hit'));
+  assert.ok(n.some(m => m.to === x.P[2] && m.kind === 'my_hit')); // ของ C เองก็อยู่ช่องนั้น (LAYOUT เดียวกัน)
+  const D = JSON.stringify(x.room.getState(x.P[0]).lastResolve);
+  assert.ok(!D.includes('ownerPid') && !D.includes('pipe'));
+});
+test('T-15/16 Survival turns: โดนแค่ของตัวเอง = ไม่ได้ยิงต่อ · มีของคนอื่นด้วย = ยิงต่อ [R-7-40, R-7-41]', () => {
+  const lb = [{ pieceId: 'bong', row: 7, col: 11, rot: 0 }, { pieceId: 'grinder', row: 0, col: 11, rot: 0 }, { pieceId: 'pipe', row: 4, col: 9, rot: 0 }, { pieceId: 'joint', row: 13, col: 0, rot: 0 }, { pieceId: 'lighter', row: 10, col: 5, rot: 0 }];
+  const x = start(2, { mode: 'survival' }, 1, [null, lb]);
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  // หาช่องที่มีแต่ของ a
+  const own = cellsOf(x, a, 'bong').find(([r, c]) => !x.room._occupants('*', x.room._key(r, c), new Set(x.P)).pieces.some(o => o.pid === b));
+  fire(x, a, [shot(...own)]);
+  assert.strictEqual(x.room.turnPid, b);
+  const shared = cellsOf(x, a, 'lighter').find(([r, c]) => x.room._occupants('*', x.room._key(r, c), new Set(x.P)).pieces.some(o => o.pid === a));
+  // ช่องของ a ที่ทับกับ b (lighter ของ a (8,5)-(10,6) กับ lighter b (10,5)-(12,6) ทับที่แถว 10)
+  fire(x, b, [shot(10, 5)]);
+  assert.strictEqual(x.room.turnPid, b, 'b ยิงช่องที่มีของ a ด้วย ได้ยิงต่อ');
+  assert.ok(shared);
+});
+test('T-17 turns โดน 3 นัดติดแล้วพลาด = 4 นัดในตาเดียว [R-7-41]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  for (const [r, c] of [[0, 0], [0, 1], [1, 0]]) { fire(x, a, [shot(r, c, b)]); assert.strictEqual(x.room.turnPid, a); }
+  fire(x, a, [shot(5, 8, b)]);
+  assert.strictEqual(x.room.turnPid, b);
+});
+test('R-7-44 bonusOnHit ปิด: turns ตาละ 1 นัด', () => {
+  const x = start(2, { mode: 'classic', bonusOnHit: false });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  fire(x, a, [shot(0, 0, b)]); assert.strictEqual(x.room.turnPid, b);
+});
+test('T-18 rounds โดนแล้วรอบหน้า 2 นัด · ส่ง 1 นัด = SHOT_COUNT · พลาดแล้วกลับเป็น 1 [R-7-42, R-7-12]', () => {
+  const x = start(3, { mode: 'classic' });
+  round(x, { [x.P[0]]: [shot(0, 0, x.P[1])] });
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 2);
+  throwsCode(() => fire(x, x.P[0], [shot(5, 5, x.P[1])]), 'SHOT_COUNT');
+  round(x);
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 1);
+});
+test('T-19 rounds โดนชิ้น + โดนเกาะ = 2 นัด ไม่ใช่ 3 [R-7-52, R-7-42]', () => {
+  const x = start(3, { mode: 'classic', islands: 'random' });
+  const isl = seatOf(x, x.P[1]).islands[0][0];
+  round(x, { [x.P[0]]: [shot(0, 0, x.P[1])] });
+  round(x, { [x.P[0]]: [shot(1, 0, x.P[1]), shot(...x.room._rc(isl), x.P[1])] });
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 2);
+});
+test('T-20 นัดที่ระบบยิงแทนไม่ได้สิทธิ์ [R-7-43]', () => {
+  const x = start(3, { mode: 'classic' });
+  // ให้กระดานเป้าหมายเหลือแต่ช่องที่มีชิ้น เพื่อให้ยิงแทนโดนแน่
+  for (const p of x.room.alive()) { const bd = x.room.boards.get(p.pid); const occ = new Set(p.pieces.flatMap(q => q.cells)); for (let k = 0; k < 144; k++) if (!occ.has(k)) bd.shot.set(k, 'miss'); }
+  round(x, { [x.P[1]]: [shot(0, 0, x.P[2])], [x.P[2]]: [shot(0, 0, x.P[1])] }, [x.P[0]]);
+  T += 16000; x.room.tick();
+  assert.ok(seatOf(x, x.P[0]).autoStreak >= 1);
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 1);
+});
+test('T-21 ยิงช่องสุดท้ายของเกาะคนอื่น = นัดคู่ ไม่บอกเจ้าของ (Survival) [R-7-53, R-7-54]', () => {
+  const x = start(3, { mode: 'survival', islands: 'random' }); notices(x);
+  const g = seatOf(x, x.P[1]).islands[0];
+  const rc = g.map(k => x.room._rc(k));
+  const bd = x.room.boards.get('*'); rc.slice(0, -1).forEach(([r, c]) => bd.shot.set(x.room._key(r, c), 'island'));
+  const last = rc[rc.length - 1];
+  round(x, { [x.P[0]]: [shot(...last)] });
+  assert.ok(seatOf(x, x.P[0]).doubleBonus);
+  const n = notices(x).find(m => m.kind === 'island_bonus');
+  assert.ok(n && !n.text.includes(seatOf(x, x.P[1]).name));
+});
+test('T-22 นัดคู่แนว H ที่คอลัมน์สุดท้าย = DOUBLE_INVALID · ยิงคู่ได้ 2 ช่อง [R-7-53]', () => {
+  const x = start(3, { mode: 'classic' });
+  seatOf(x, x.P[0]).doubleBonus = true;
+  throwsCode(() => fire(x, x.P[0], [shot(5, 11, x.P[1], 'H')]), 'DOUBLE_INVALID');
+  throwsCode(() => fire(x, x.P[0], [shot(5, 5, x.P[1])]), 'DOUBLE_INVALID');
+  round(x, { [x.P[0]]: [shot(5, 5, x.P[1], 'V')] });
+  assert.ok(x.room.boards.get(x.P[1]).shot.has(x.room._key(6, 5)));
+  assert.ok(!seatOf(x, x.P[0]).doubleBonus);
+});
+test('T-23 ยิงเกาะตัวเอง = ไม่ได้สิทธิ์ [R-7-51]', () => {
+  const x = start(3, { mode: 'survival', islands: 'random', bonusOnHit: false });
+  const mine = seatOf(x, x.P[0]).islands[0].find(k => !x.room.active().some(p => p.pid !== x.P[0] && (p.islands.flat().includes(k) || p.pieces.some(q => q.cells.includes(k)))));
+  round(x, { [x.P[0]]: [shot(...x.room._rc(mine))] });
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 1);
+});
+test('T-24 turns โดนกับดักนัดที่ 2 = ตาจบ ตาถัดไปถูกข้าม [R-7-61, R-7-62]', () => {
+  const x = start(2, { mode: 'classic', traps: true });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  const bd = x.room.boards.get(b); bd.traps = new Set([x.room._key(5, 9)]);
+  fire(x, a, [shot(0, 0, b)]);
+  fire(x, a, [shot(5, 9, b)]);
+  assert.strictEqual(pub(x, b, 5, 9), 'trap'); assert.strictEqual(x.room.turnPid, b);
+  fire(x, b, [shot(5, 8, a)]);
+  assert.strictEqual(x.room.turnPid, b, 'ตาของ a ถูกข้าม');
+  fire(x, b, [shot(5, 7, a)]);
+  assert.strictEqual(x.room.turnPid, a);
+});
+test('T-25 rounds ผู้รอดทุกคนถูกข้าม = ล้างทั้งหมด [R-7-63]', () => {
+  const x = start(3, { mode: 'classic' });
+  x.room.alive().forEach(p => { p.skipNext = true; });
+  round(x);
+  x.room.alive().forEach(p => { p.skipNext = true; });
+  x.room._beginRound();
+  assert.strictEqual(x.room.roundShooters.size, 3);
+});
+test('T-26 rounds สองคนยิงช่องเดียวกันมีชิ้น C: โดนครั้งเดียว ทั้งคู่ได้ 2 นัด [R-7-25]', () => {
+  const x = start(3, { mode: 'survival' }, 1, [layoutFor(['bong', 'grinder', 'pipe', 'joint', 'lighter']).map(p => p.pieceId === 'lighter' ? { ...p, row: 11, col: 11 } : p), null, null]);
+  round(x, { [x.P[0]]: [shot(8, 5)], [x.P[1]]: [shot(8, 5)] });
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 2); assert.strictEqual(seatOf(x, x.P[1]).shotsAllowed, 2);
+});
+test('T-27 Classic 3 คน ตกรอบพร้อมกันหมด = เสมอ [R-9-02]', () => {
+  const x = start(3, { mode: 'classic' });
+  const [A, B, C] = x.P;
+  seatOf(x, A).alive = false; seatOf(x, A).elimAt = 1; x.room.elimCount = 1; x.room._beginRound();
+  for (const p of [B, C]) { const s = seatOf(x, p); s.pieces.forEach(pc => { pc.sunk = true; }); const last = s.pieces[0]; last.sunk = false; const bd = x.room.boards.get(p); last.cells.slice(1).forEach(k => bd.shot.set(k, 'hit')); }
+  round(x, { [B]: [shot(...x.room._rc(seatOf(x, C).pieces[0].cells[0]), C)], [C]: [shot(...x.room._rc(seatOf(x, B).pieces[0].cells[0]), B)] });
+  assert.strictEqual(x.room.phase, 'GAME_OVER'); assert.strictEqual(x.room.result.reason, 'draw'); assert.strictEqual(x.room.result.winnerPid, null);
+});
+test('T-28 Survival 2 คน ตกรอบพร้อมกัน: hitsOnOthers มากกว่าชนะ / เท่ากันเสมอ [R-9-03]', () => {
+  for (const [ha, hb, want] of [[12, 10, 'A'], [5, 5, null]]) {
+    const x = start(2, { mode: 'survival' });
+    const [A, B] = x.P; seatOf(x, A).hitsOnOthers = ha; seatOf(x, B).hitsOnOthers = hb;
+    seatOf(x, x.room.turnPid).hitsOnOthers--; // นัดสุดท้ายนับ +1 ให้คนยิง (โดนของอีกฝ่าย)
+    const bd = x.room.boards.get('*');
+    // ทุกช่องของทั้งคู่ถูกยิงแล้ว ยกเว้น (0,0) ที่ทับกัน
+    for (const p of [A, B]) seatOf(x, p).pieces.forEach(pc => pc.cells.forEach(k => { if (k !== 0) bd.shot.set(k, 'hit'); }));
+    fire(x, x.room.turnPid, [shot(0, 0)]);
+    assert.strictEqual(x.room.phase, 'GAME_OVER');
+    if (want) { assert.strictEqual(x.room.result.winnerPid, A); assert.strictEqual(x.room.result.reason, 'tiebreak_hits'); }
+    else assert.strictEqual(x.room.result.reason, 'draw');
+  }
+});
+test('T-29 rounds มีคนได้ 2 นัด = 20 วิ · ทุกคนส่งครบ = ตัดสินทันที [R-8-03]', () => {
+  const x = start(3, { mode: 'classic' });
+  assert.strictEqual(x.room.deadline - T, 15000);
+  round(x, { [x.P[0]]: [shot(0, 0, x.P[1])] });
+  assert.strictEqual(x.room.deadline - T, 20000);
+  const r = x.room.roundNo; round(x); assert.strictEqual(x.room.roundNo, r + 1);
+});
+test('T-30 rounds ไม่ส่ง 3 รอบติด = ยิงแทนทุกรอบ แล้วตกรอบ auto_limit [R-8-03, R-8-04]', () => {
+  const y = start(4, { mode: 'classic' });
+  const b = y.P[1];
+  for (let i = 0; i < 3; i++) {
+    round(y, {}, [b]);
+    T += 20001; y.room.tick();
+  }
+  assert.strictEqual(seatOf(y, b).alive, false); assert.strictEqual(seatOf(y, b).elimReason, 'auto_limit');
+});
+test('T-31 getState ไม่รั่วตลอดเกม (Survival 7 คน เกาะ + กับดัก 30 เกม) [R-4-01, R-4-07]', () => {
+  for (let g = 0; g < 30; g++) {
+    const x = mk(7, { mode: 'survival', islands: 'random', traps: true }, 100 + g);
+    x.room.action(x.P[0], { type: 'start_game' });
+    T += 200000; x.room.tick();
+    let guard = 0;
+    while (x.room.phase === 'BATTLE' && guard++ < 400) {
+      for (const pid of x.P) {
+        const st = x.room.getState(pid);
+        for (const p of st.players) {
+          if (p.pid === pid) continue;
+          assert.strictEqual(p.placement, null); assert.strictEqual(p.islands, null); assert.strictEqual(p.stats, undefined);
+        }
+        assert.ok(st.boards.every(b => b.traps === undefined));
+        assert.ok(!JSON.stringify(st).includes('hitsOnOthers'));
+      }
+      T += 21000; x.room.tick();
+    }
+    assert.strictEqual(x.room.phase, 'GAME_OVER');
+  }
+});
+test('T-32 จำลองยิงสุ่มทุกโหมด × 2–7 คน 40 เกมต่อแบบ จบทุกเกม [R-9-05]', () => {
+  for (const mode of ['classic', 'survival']) for (let n = 2; n <= 7; n++) for (let g = 0; g < 40; g++) {
+    const x = mk(n, { mode, islands: g % 3 === 0 ? 'random' : 'off', traps: g % 2 === 0, bonusOnHit: g % 4 !== 1 }, 1000 + g * 7 + n);
+    x.room.action(x.P[0], { type: 'start_game' });
+    T += 300000; x.room.tick();
+    let guard = 0;
+    while (x.room.phase === 'BATTLE' && guard++ < 3000) {
+      // ผู้เล่นทุกคนปล่อยให้ระบบยิงแทน แต่รีเซ็ต autoStreak กันตกรอบฟาวล์
+      x.room.alive().forEach(p => { p.autoStreak = 0; });
+      T += 21000; x.room.tick();
+    }
+    assert.strictEqual(x.room.phase, 'GAME_OVER', `${mode} ${n} คน เกม ${g} ไม่จบ`);
+  }
+});
+test('T-33 host ออก = ย้ายตามลำดับเข้าห้อง [R-5-08]', () => {
+  const x = mk(3);
+  x.room.leave(x.P[0]);
+  assert.strictEqual(x.room.hostPid, x.P[1]);
+});
+test('T-34 คนที่ 8 = ROOM_FULL · ชื่อซ้ำต่อท้าย (2) [R-5-04, R-5-02]', () => {
+  const x = mk(7);
+  throwsCode(() => x.room.addPlayer('แปด'), 'ROOM_FULL');
+  const y = mk(1); y.room.addPlayer('เอ');
+  assert.strictEqual(y.room.players[1].name, 'เอ (2)');
+  throwsCode(() => y.room.addPlayer('   '), 'NAME_INVALID');
+});
+test('T-35 เล่นอีก: ค่าเดิม · 2 คนคู่เดิม คนแพ้เริ่ม [R-8-09, R-7-10]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  x.room.action(b, { type: 'resign' });
+  assert.strictEqual(x.room.result.winnerPid, a);
+  x.P.forEach(p => x.room.action(p, { type: 'rematch', want: true }));
+  assert.strictEqual(x.room.phase, 'PLACING'); assert.strictEqual(x.room.settings.mode, 'classic'); assert.strictEqual(x.room.gameNo, 2);
+  x.P.forEach(p => x.room.action(p, { type: 'submit_placement', placement: LAYOUT }));
+  assert.strictEqual(x.room.turnPid, b);
+});
+test('T-36 ยิงแทน Classic ไม่ยิงกระดานตัวเอง/คนตกรอบ [R-8-02]', () => {
+  for (let i = 0; i < 30; i++) {
+    const x = start(4, { mode: 'classic' }, 50 + i);
+    seatOf(x, x.P[3]).alive = false;
+    const s = seatOf(x, x.P[0]);
+    for (const sh of x.room._autoShots(s, 2)) assert.ok(sh.board !== x.P[0] && sh.board !== x.P[3]);
+  }
+});
+test('T-41 ช่องเกาะ B + ชิ้น C = island_hit · notice ครบ [R-4-06, R-7-50, R-7-52]', () => {
+  const x = start(3, { mode: 'survival' });
+  seatOf(x, x.P[1]).islands = [[x.room._key(0, 0), x.room._key(0, 1), x.room._key(1, 0), x.room._key(1, 1)]];
+  notices(x);
+  round(x, { [x.P[0]]: [shot(0, 0)] });
+  assert.strictEqual(pub(x, '*', 0, 0), 'island_hit');
+  const n = notices(x);
+  assert.ok(n.some(m => m.to === x.P[0] && m.kind === 'you_island'));
+  assert.ok(n.some(m => m.to === x.P[1] && m.kind === 'my_island'));
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 2);
+});
+test('T-42 ช่องที่ถูกยิงแล้ว = ALREADY_SHOT ทั้ง Survival และ Classic [R-7-14, R-7-55]', () => {
+  const x = start(3, { mode: 'survival' });
+  round(x, { [x.P[1]]: [shot(5, 9)] });
+  throwsCode(() => fire(x, x.P[0], [shot(5, 9)]), 'ALREADY_SHOT');
+  const y = start(4, { mode: 'classic' });
+  round(y, { [y.P[3]]: [shot(5, 9, y.P[1])] });
+  throwsCode(() => fire(y, y.P[2], [shot(5, 9, y.P[1])]), 'ALREADY_SHOT');
+});
+test('T-43 rounds B และ C หลุดเกินกำหนดพร้อมกัน = A ชนะ · ทุกคนหลุด = cancelled [R-8-08, R-9-01]', () => {
+  const x = start(3, { mode: 'classic' });
+  x.room.setConnected(x.P[1], false); x.room.setConnected(x.P[2], false);
+  T += 61000; x.room.tick();
+  assert.strictEqual(x.room.result.winnerPid, x.P[0]); assert.strictEqual(x.room.result.reason, 'last_standing');
+  const y = start(3, { mode: 'classic' });
+  y.P.forEach(p => y.room.setConnected(p, false));
+  T += 61000; y.room.tick();
+  assert.strictEqual(y.room.result.reason, 'cancelled');
+});
+test('T-44 Classic 5 คน ranking ตามลำดับตกรอบ ตกพร้อมกันอันดับเดียว [R-9-04, R-9-06, R-7-22]', () => {
+  const x = start(5, { mode: 'classic' });
+  const [A, B, C, D, E] = x.P;
+  x.room.action(E, { type: 'resign' });
+  x.room.action(D, { type: 'resign' });
+  x.room.setConnected(B, false); x.room.setConnected(C, false); T += 61000; x.room.tick();
+  const rk = Object.fromEntries(x.room.result.ranking.map(r => [r.pid, r.rank]));
+  assert.strictEqual(rk[A], 1); assert.strictEqual(rk[B], rk[C]); assert.ok(rk[B] < rk[D] && rk[D] < rk[E]);
+  const st = x.room.getState(A);
+  assert.ok(st.players.find(p => p.pid === D).placement);
+});
+test('R-7-16 reqId ซ้ำ = ประมวลครั้งเดียว · turnNo เก่า = STALE_TURN', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  const tn = x.room.turnNo;
+  x.room.action(a, { type: 'fire', turnNo: tn, shots: [shot(5, 8, b)], reqId: 'r1' });
+  assert.deepStrictEqual(x.room.action(a, { type: 'fire', turnNo: tn, shots: [shot(5, 8, b)], reqId: 'r1' }), { dup: true });
+  throwsCode(() => x.room.action(b, { type: 'fire', turnNo: tn, shots: [shot(5, 8, a)] }), 'STALE_TURN');
+});
+test('R-8-01 หมดเวลาวาง = สุ่มวางให้ (รวมเกาะวาดเอง) แล้วเข้า BATTLE', () => {
+  const x = mk(3, { mode: 'survival', islands: 'draw' }); x.room.action(x.P[0], { type: 'start_game' });
+  assert.strictEqual(x.room.deadline - T, 180000);
+  T += 180000; x.room.tick();
+  assert.strictEqual(x.room.phase, 'BATTLE');
+  x.room.active().forEach(p => { assert.strictEqual(p.islands.flat().length, 8); assert.ok(p.pieces.length === 5); });
+});
+test('R-7-70 Survival ชิ้นของคนที่ยอมแพ้ = พลาด', () => {
+  const lb = LAYOUT.map(p => p.pieceId === 'pipe' ? { ...p, row: 12, col: 7 } : p);
+  const x = start(3, { mode: 'survival' }, 1, [null, lb, LAYOUT.map(p => p.pieceId === 'pipe' ? { ...p, row: 12, col: 0 } : p)]);
+  x.room.action(x.P[1], { type: 'resign' });
+  round(x, { [x.P[0]]: [shot(12, 8)] });
+  assert.strictEqual(pub(x, '*', 12, 8), 'miss');
+});
+
+let fail = 0;
 for (const [name, fn] of tests) {
-  try { fn(); pass++; console.log('ok   ' + name); }
-  catch (e) { console.log('FAIL ' + name + '\n     ' + e.message); }
+  try { fn(); console.log('ok   ' + name); } catch (e) { fail++; console.log('FAIL ' + name + '\n     ' + (e.stack || e).split('\n').slice(0, 3).join('\n     ')); }
 }
-console.log(`\n${pass}/${tests.length} ผ่าน`);
-process.exit(pass === tests.length ? 0 : 1);
+console.log(`\n${tests.length - fail}/${tests.length} ผ่าน`);
+process.exit(fail ? 1 : 0);

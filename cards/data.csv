@@ -1,6 +1,6 @@
-id,name,size,flavor
-bong,บ้อง,5,เสาหลักของวง ใหญ่สุด ซ่อนยากสุด
-grinder,เครื่องบด,4,หมุนทีไร วงเริ่มทีนั้น
-pipe,ไปป์,3,สายคลาสสิก ไม่เคยตกยุค
-joint,โรล,3,ม้วนเสร็จ พร้อมส่งต่อ
-lighter,ไฟแช็ก,2,เล็กสุด แต่ขาดไม่ได้
+id,name,shape
+bong,บ้องไผ่,XX./XX./XX./XX./XXX/XXX/XX.
+grinder,เครื่องบด,XXX/XXX/XXX
+pipe,ไปป์,XXXXX/XXXXX
+joint,โรล,XXXX
+lighter,ไฟแช็ก,XX/XX/XX

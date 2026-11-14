@@ -1,184 +1,185 @@
 'use strict';
-// กติกาทั้งหมดของ Battle Weed: Green Social (spec v1.0) — ไม่ import express/socket.io
+// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.1) — ไม่ import express/socket.io
 // รหัสกติกา R-x-yy อ้างถึงหัวข้อใน spec.md
 const crypto = require('crypto');
 
 // หัวข้อ 3: ค่าคงที่ทุกตัวอยู่ที่นี่ที่เดียว
 const CONFIG = Object.freeze({
-  BOARD_SIZE: 10,
-  PLACE_TIME: 90,          // วินาที
-  SHOT_TIME: 30,           // วินาทีต่อนัด
-  AUTO_SHOT_LIMIT: 3,      // ตาติดกัน
-  RECONNECT_GRACE: 60,     // วินาที
-  ROOM_IDLE_CLOSE: 600,    // วินาทีที่ไม่มีผู้เล่นเชื่อมต่อ
+  MIN_PLAYERS: 2,
+  MAX_PLAYERS: 7,
+  SIMUL_MIN_PLAYERS: 3,
+  CLASSIC_BOARD: 12,
+  CLASSIC_FLEET: ['bong', 'grinder', 'pipe', 'joint', 'lighter'],
+  SURVIVAL_BOARD: { 2: 14, 3: 16, 4: 16, 5: 17, 6: 16, 7: 16 },
+  SURVIVAL_FLEET: {
+    2: ['bong', 'grinder', 'pipe', 'joint', 'lighter'], 3: ['bong', 'grinder', 'pipe', 'joint', 'lighter'],
+    4: ['grinder', 'pipe', 'joint', 'lighter'], 5: ['grinder', 'pipe', 'joint', 'lighter'],
+    6: ['pipe', 'joint', 'lighter'], 7: ['pipe', 'joint', 'lighter'],
+  },
+  PLACE_TIME: 120,          // วินาที
+  ISLAND_DRAW_TIME: 60,     // วินาที เพิ่มเมื่อเกาะแบบวาดเอง
+  SHOT_TIME: 15,            // วินาทีต่อนัด / ต่อรอบที่ทุกคนได้ 1 นัด
+  ROUND_TIME_DOUBLE: 20,    // วินาที รอบที่มีคนได้ 2 นัด (Q78)
+  MAX_SHOTS_PER_ROUND: 2,
+  AUTO_SHOT_LIMIT: 3,
+  RECONNECT_GRACE: 60,
+  ROOM_IDLE_CLOSE: 600,
+  ISLAND_CELLS: 8,
+  ISLAND_MIN_GROUP: 4,
+  ISLAND_RANDOM_MAX_SHARED: 2,
+  TRAP_RATE: 0.02,
+  ANIM_BULLET_MS: 1000,
+  ANIM_EFFECT_MS: 1000,
+  SUNK_REVEAL_MS: 2000,
+  IMAGE_MARGIN: 0.12,
   ROOM_CODE_LEN: 5,
   ROOM_CODE_CHARS: 'ABCDEFGHJKMNPQRSTUVWXYZ23456789',
   NAME_MAX: 16,
-  FLEET_MIN_PIECES: 1,
-  FLEET_MAX_PIECES: 7,
-  FLEET_MAX_CELLS: 30,
-  PIECE_SIZE_MIN: 2,
-  PIECE_SIZE_MAX: 5,
   MIN_AGE: 20,
+  PLAYER_COLORS: ['#F2C230', '#FF5FA2', '#F5F5F5', '#E53935', '#A1673A', '#FFB74D', '#3F51B5'],
   REQID_MEMORY: 50,
-  SUGGEST_COOLDOWN: 1,     // วินาที
-  SUNK_BANNER_MS: 2000,
+  SUGGEST_COOLDOWN: 1,
   MIN_SCREEN_PX: 360,
-  THUMB_MIN_PX: 110,
 });
 
-// R-3-01 ตรวจ config ตอนเริ่ม คืนรายการปัญหา (ว่าง = ผ่าน)
-function validateConfig(c) {
+// R-3-01 ตรวจ config ตอนเริ่ม (catalogIds = id ใน cards/data.csv) คืนรายการปัญหา
+function validateConfig(c, catalogIds) {
   const errs = [];
-  for (const k of ['PLACE_TIME', 'SHOT_TIME', 'RECONNECT_GRACE', 'ROOM_IDLE_CLOSE']) {
+  for (const k of ['PLACE_TIME', 'ISLAND_DRAW_TIME', 'SHOT_TIME', 'ROUND_TIME_DOUBLE', 'RECONNECT_GRACE', 'ROOM_IDLE_CLOSE']) {
     if (!Number.isInteger(c[k]) || c[k] < 5) errs.push(`${k} ต้องเป็นจำนวนเต็ม >= 5 (ได้ ${c[k]})`);
   }
-  if (!Number.isInteger(c.AUTO_SHOT_LIMIT) || c.AUTO_SHOT_LIMIT < 1) errs.push(`AUTO_SHOT_LIMIT ต้อง >= 1 (ได้ ${c.AUTO_SHOT_LIMIT})`);
-  if (c.BOARD_SIZE !== 10) errs.push('BOARD_SIZE ล็อกไว้ที่ 10');
+  if (!Number.isInteger(c.AUTO_SHOT_LIMIT) || c.AUTO_SHOT_LIMIT < 1) errs.push('AUTO_SHOT_LIMIT ต้อง >= 1');
+  if (c.PLAYER_COLORS.length < c.MAX_PLAYERS) errs.push('PLAYER_COLORS ต้องมีอย่างน้อย MAX_PLAYERS สี');
+  for (let n = c.MIN_PLAYERS; n <= c.MAX_PLAYERS; n++) {
+    if (!Number.isInteger(c.SURVIVAL_BOARD[n])) errs.push(`SURVIVAL_BOARD ไม่มีค่าของ ${n} คน`);
+    if (!Array.isArray(c.SURVIVAL_FLEET[n]) || !c.SURVIVAL_FLEET[n].length) errs.push(`SURVIVAL_FLEET ไม่มีค่าของ ${n} คน`);
+  }
+  if (catalogIds) {
+    const ids = new Set(catalogIds);
+    const all = [...c.CLASSIC_FLEET, ...Object.values(c.SURVIVAL_FLEET).flat()];
+    for (const id of new Set(all)) if (!ids.has(id)) errs.push(`fleet อ้าง id "${id}" ที่ไม่มีใน catalog`);
+  }
   return errs;
 }
 
 class GameError extends Error {
   constructor(code, message, reason) { super(message); this.code = code; this.reason = reason; }
 }
-
 const MSG = {
-  ROOM_FULL: 'ห้องนี้เต็มหรือเริ่มเกมแล้ว',
-  NAME_INVALID: 'กรุณาใส่ชื่อ 1–16 ตัวอักษร',
-  BAD_PHASE: 'ทำแบบนี้ตอนนี้ไม่ได้',
-  ALREADY_PLACED: 'ยืนยันการวางไปแล้ว',
-  PLACEMENT_INVALID: 'การวางไม่ถูกต้อง',
-  NOT_YOUR_TURN: 'ยังไม่ถึงตาคุณ',
-  OUT_OF_BOUNDS: 'พิกัดอยู่นอกกระดาน',
-  ALREADY_SHOT: 'ยิงช่องนี้ไปแล้ว',
-  STALE_TURN: 'ตานี้ผ่านไปแล้ว',
-  NO_OPPONENT: 'อีกฝ่ายออกจากห้องแล้ว',
-  BAD_REQUEST: 'คำสั่งไม่ถูกต้อง',
-  BAD_TOKEN: 'ที่นั่งนี้ใช้ไม่ได้แล้ว',
+  ROOM_FULL: 'ห้องนี้เต็มหรือเริ่มเกมแล้ว', NAME_INVALID: 'กรุณาใส่ชื่อ 1–16 ตัวอักษร', BAD_PHASE: 'ทำแบบนี้ตอนนี้ไม่ได้',
+  ALREADY_PLACED: 'ยืนยันการวางไปแล้ว', PLACEMENT_INVALID: 'การวางไม่ถูกต้อง', NOT_YOUR_TURN: 'ยังยิงไม่ได้ตอนนี้',
+  OUT_OF_BOUNDS: 'พิกัดอยู่นอกกระดาน', ALREADY_SHOT: 'ช่องนี้ถูกยิงแล้ว', STALE_TURN: 'ตานี้ผ่านไปแล้ว',
+  BAD_REQUEST: 'คำสั่งไม่ถูกต้อง', BAD_TOKEN: 'ที่นั่งนี้ใช้ไม่ได้แล้ว', NOT_HOST: 'เฉพาะหัวห้องเท่านั้น',
+  NOT_ENOUGH_PLAYERS: 'ต้องมีผู้เล่นอย่างน้อย 2 คน', BAD_TARGET: 'ยิงกระดานนี้ไม่ได้', SHOT_COUNT: 'จำนวนนัดไม่ถูกต้อง',
+  ALREADY_SUBMITTED: 'ส่งนัดของรอบนี้แล้ว', DOUBLE_INVALID: 'นัดคู่ต้องยิง 2 ช่องติดกันที่ยังไม่ถูกยิง',
+  CARDS_NOT_READY: 'ข้อมูลชิ้นไม่พร้อม',
 };
 const REASON_MSG = {
-  PIECES: 'ต้องวางอุปกรณ์ทุกชิ้น ชิ้นละครั้ง',
-  BOUNDS: 'มีชิ้นล้นออกนอกกระดาน',
-  DIR: 'ทิศต้องเป็นแนวนอนหรือแนวตั้ง',
-  OVERLAP: 'อุปกรณ์วางซ้อนกัน',
+  PIECES: 'ต้องวางอุปกรณ์ทุกชิ้น ชิ้นละครั้ง', BOUNDS: 'มีชิ้นล้นออกนอกกระดาน', ROT: 'การหมุนไม่ถูกต้อง',
+  OVERLAP: 'อุปกรณ์ของคุณวางซ้อนกัน', ISLANDS: 'เกาะต้องครบจำนวนช่อง และแต่ละเกาะต่อกันอย่างน้อย 4 ช่อง',
 };
 const err = (code, reason) => new GameError(code, reason ? REASON_MSG[reason] : MSG[code], reason);
-
-const N = CONFIG.BOARD_SIZE;
-const key = (r, c) => r * N + c;
 const isInt = v => Number.isInteger(v);
 
-function pieceCells(p, size) { // R-7-03
-  const out = [];
-  for (let i = 0; i < size; i++) out.push(p.dir === 'H' ? [p.row, p.col + i] : [p.row + i, p.col]);
-  return out;
+// ---------- รูปช่อง (R-4.1-03, R-4.1-05) ----------
+// "XX./XXX" -> [[r,c],...] หรือ null ถ้าผิดรูปแบบ
+function parseShape(str) {
+  if (typeof str !== 'string' || !/^[X.]+(\/[X.]+)*$/.test(str)) return null;
+  const rows = str.split('/');
+  if (rows.some(r => r.length !== rows[0].length)) return null;
+  const cells = [];
+  rows.forEach((row, r) => [...row].forEach((ch, c) => { if (ch === 'X') cells.push([r, c]); }));
+  if (!cells.length || cells.length > 30) return null;
+  const set = new Set(cells.map(([r, c]) => r + ',' + c));
+  const seen = new Set([cells[0].join(',')]); const q = [cells[0]];
+  while (q.length) {
+    const [r, c] = q.pop();
+    for (const [dr, dc] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const k = (r + dr) + ',' + (c + dc);
+      if (set.has(k) && !seen.has(k)) { seen.add(k); q.push([r + dr, c + dc]); }
+    }
+  }
+  return seen.size === cells.length ? cells : null;
 }
-
-// R-7-01..R-7-04 คืน Map(cellKey -> pieceId) หรือ throw
-function validatePlacement(placement, fleet) {
-  if (!Array.isArray(placement)) throw err('BAD_REQUEST');
-  for (const p of placement) {
-    if (!p || typeof p !== 'object' || typeof p.pieceId !== 'string') throw err('BAD_REQUEST');
+function rotateCells(cells, rot) { // R-4.1-05 หมุน 90° ตามเข็ม (r,c)->(c,H-1-r) ไม่มีกลับด้าน
+  let cur = cells.map(x => [...x]);
+  for (let i = 0; i < rot; i++) {
+    const H = Math.max(...cur.map(x => x[0])) + 1;
+    cur = cur.map(([r, c]) => [c, H - 1 - r]);
   }
-  const ids = new Set(fleet.map(f => f.id));
-  const seen = new Set();
-  for (const p of placement) {
-    if (!ids.has(p.pieceId) || seen.has(p.pieceId)) throw err('PLACEMENT_INVALID', 'PIECES');
-    seen.add(p.pieceId);
-  }
-  if (seen.size !== fleet.length) throw err('PLACEMENT_INVALID', 'PIECES');
-  for (const p of placement) if (p.dir !== 'H' && p.dir !== 'V') throw err('PLACEMENT_INVALID', 'DIR');
-  const size = Object.fromEntries(fleet.map(f => [f.id, f.size]));
-  const cells = new Map();
-  for (const p of placement) {
-    if (!isInt(p.row) || !isInt(p.col)) throw err('PLACEMENT_INVALID', 'BOUNDS');
-    for (const [r, c] of pieceCells(p, size[p.pieceId])) {
-      if (r < 0 || r >= N || c < 0 || c >= N) throw err('PLACEMENT_INVALID', 'BOUNDS');
-    }
-  }
-  for (const p of placement) {
-    for (const [r, c] of pieceCells(p, size[p.pieceId])) {
-      const k = key(r, c);
-      if (cells.has(k)) throw err('PLACEMENT_INVALID', 'OVERLAP'); // R-7-04 ชิดได้ ห้ามซ้อน
-      cells.set(k, p.pieceId);
-    }
-  }
-  return cells;
-}
-
-// R-7-06 / R-8-01 สุ่มวาง: ชิ้นใหญ่ก่อน สุ่มจากตำแหน่งที่ถูกกติกาทั้งหมด ตันแล้วเริ่มใหม่
-function randomPlacement(fleet, rand) {
-  const order = fleet.map((f, i) => ({ ...f, i })).sort((a, b) => b.size - a.size || a.i - b.i);
-  for (let attempt = 0; attempt < 200; attempt++) {
-    const used = new Set(); const out = []; let ok = true;
-    for (const f of order) {
-      const opts = [];
-      for (const dir of ['H', 'V']) for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
-        const cells = pieceCells({ row: r, col: c, dir }, f.size);
-        if (cells.every(([y, x]) => y < N && x < N && !used.has(key(y, x)))) opts.push({ pieceId: f.id, row: r, col: c, dir });
-      }
-      if (!opts.length) { ok = false; break; }
-      const pick = opts[Math.floor(rand() * opts.length)];
-      for (const [y, x] of pieceCells(pick, f.size)) used.add(key(y, x));
-      out.push(pick);
-    }
-    if (ok) return out;
-  }
-  // R-3-02 ภายในเพดาน config วางแถวละชิ้นได้เสมอ
-  return order.map((f, i) => ({ pieceId: f.id, row: i, col: 0, dir: 'H' }));
+  const mr = Math.min(...cur.map(x => x[0])), mc = Math.min(...cur.map(x => x[1]));
+  return cur.map(([r, c]) => [r - mr, c - mc]);
 }
 
 const cryptoRand = () => crypto.randomInt(0, 2 ** 32) / 2 ** 32;
+const NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
 class Room {
   constructor(code, { cards, rand = cryptoRand, now = () => Date.now(), onLog = () => {}, config = CONFIG } = {}) {
-    if (!Array.isArray(cards) || !cards.length) throw new Error('ต้องมี catalog การ์ด');
+    if (!Array.isArray(cards) || !cards.length) throw new Error('ต้องมี catalog ชิ้น');
     this.code = code;
-    this.fleet = cards.map(c => ({ id: c.id, size: +c.size })); // R-4.1-07 ทุกชิ้นใน catalog ชิ้นละ 1
+    this.catalog = new Map(cards.map(c => [c.id, { id: c.id, name: c.name, shape: parseShape(c.shape) }]));
     this.rand = rand; this.now = now; this.onLog = onLog; this.C = config;
-    this.players = [];
-    this.phase = 'LOBBY';
-    this.gameNo = 0;
-    this.turnPid = null; this.turnNo = 0; this.deadline = null;
-    this.lastShot = null; this.result = null; this.prev = null;
-    this.emptySince = null;
-    this.log = [];
+    this.players = []; this.joinSeq = 0;
+    this.hostPid = null;
+    this.settings = { mode: 'classic', bonusOnHit: true, islands: 'off', traps: false }; // R-5-01
+    this.phase = 'LOBBY'; this.gameNo = 0;
+    this.turnStyle = null; this.boardSize = null; this.fleet = [];
+    this.turnPid = null; this.turnNo = 0; this.roundNo = 0; this.deadline = null;
+    this.boards = new Map(); this.lastResolve = []; this.result = null; this.prev = null;
+    this.elimCount = 0; this.emptySince = null; this.log = []; this.notices = [];
   }
 
-  // ---------- เครื่องมือภายใน ----------
+  // ---------- เครื่องมือ ----------
   _log(type, data = {}) {
     const e = { t: this.now(), room: this.code, game: this.gameNo, type, ...data };
-    this.log.push(e); if (this.log.length > 2000) this.log.shift();
+    this.log.push(e); if (this.log.length > 3000) this.log.shift();
     this.onLog(e);
   }
-  seat(pid) { return this.players.find(p => p.pid === pid); }
-  opp(pid) { return this.players.find(p => p.pid !== pid); }
+  _notice(to, kind, text, data = {}) { this.notices.push({ to, kind, text, ...data }); }
+  drainNotices() { const n = this.notices; this.notices = []; return n; }
+  seat(pid) { return this.players.find(p => p.pid === pid && !p.removed); }
   _need(pid) { const s = this.seat(pid); if (!s) throw err('BAD_TOKEN'); return s; }
+  active() { return this.players.filter(p => !p.removed); }
+  alive() { return this.players.filter(p => p.alive && !p.removed); }
+  _rint(n) { return Math.floor(this.rand() * n); }
+  _key(r, c) { return r * this.boardSize + c; }
+  _rc(k) { return [Math.floor(k / this.boardSize), k % this.boardSize]; }
+  _pieceName(id) { return (this.catalog.get(id) || {}).name || id; }
 
-  // ---------- เข้าห้อง (R-5-02, R-5-04, R-5-05) ----------
+  // ---------- ห้อง (R-5-01..R-5-08) ----------
   addPlayer(rawName) {
     if (typeof rawName !== 'string') throw err('NAME_INVALID');
     let name = rawName.trim();
     if (!name || [...name].length > this.C.NAME_MAX) throw err('NAME_INVALID');
-    if (this.phase !== 'LOBBY' || this.players.length >= 2) throw err('ROOM_FULL');
-    if (this.players.some(p => p.name === name)) name += ' (2)';
+    const act = this.active();
+    if (this.phase !== 'LOBBY' || act.length >= this.C.MAX_PLAYERS) throw err('ROOM_FULL');   // R-5-04
+    if (act.some(p => p.name === name)) {                                                     // R-5-02
+      let i = 2; while (act.some(p => p.name === `${name} (${i})`)) i++;
+      name = `${name} (${i})`;
+    }
+    const used = new Set(act.map(p => p.color));
     const seat = {
       pid: crypto.randomBytes(8).toString('hex'), token: crypto.randomBytes(16).toString('hex'),
-      name, connected: true, disconnectedAt: null, reqIds: [], lastSuggest: 0,
+      name, color: this.C.PLAYER_COLORS.find(c => !used.has(c)), joinSeq: this.joinSeq++,   // R-5-07
+      connected: true, disconnectedAt: null, reqIds: [], lastSuggest: 0, removed: false,
     };
     this._resetSeat(seat);
     this.players.push(seat);
+    if (!this.hostPid || !this.seat(this.hostPid)) this.hostPid = seat.pid;
     this.emptySince = null;
     this._log('join', { pid: seat.pid, name });
-    if (this.players.length === 2) this._startGame();
     return { pid: seat.pid, token: seat.token };
   }
   _resetSeat(s) {
-    s.ready = false; s.placement = null; s.cells = new Map();
-    s.shotsTaken = new Map(); s.sunk = []; s.autoStreak = 0; s.wantsRematch = false;
+    Object.assign(s, {
+      ready: false, alive: true, wantsRematch: false, placement: null, pieces: [], islands: [],
+      autoStreak: 0, shotsAllowed: 1, doubleBonus: false, skipNext: false, hitsOnOthers: 0,
+      pending: null, elimAt: null, elimReason: null, shots: 0, hits: 0,
+    });
   }
-  resume(token) { // R-8-05
-    const s = typeof token === 'string' && this.players.find(p => p.token === token);
+  resume(token) {
+    const s = typeof token === 'string' && this.players.find(p => p.token === token && !p.removed);
     if (!s) throw err('BAD_TOKEN');
     s.connected = true; s.disconnectedAt = null; this.emptySince = null;
     this._log('rejoin', { pid: s.pid, ok: true });
@@ -188,61 +189,197 @@ class Room {
     const s = this.seat(pid); if (!s) return;
     s.connected = on; s.disconnectedAt = on ? null : this.now();
     if (!on) this._log('disconnect', { pid });
-    if (!this.players.some(p => p.connected) && this.emptySince == null) this.emptySince = this.now();
-    if (on) this.emptySince = null;
+    this._checkEmpty();
+  }
+  _checkEmpty() {
+    if (!this.active().some(p => p.connected)) { if (this.emptySince == null) this.emptySince = this.now(); }
+    else this.emptySince = null;
+  }
+  _fixHost() { // R-5-08
+    if (this.seat(this.hostPid)) return;
+    const next = this.active().sort((a, b) => a.joinSeq - b.joinSeq)[0];
+    this.hostPid = next ? next.pid : null;
+    if (next) this._notice('all', 'host', `${next.name} เป็นหัวห้องแล้ว`);
   }
   _removeSeat(pid) {
-    this.players = this.players.filter(p => p.pid !== pid);
-    if (!this.players.some(p => p.connected) && this.emptySince == null) this.emptySince = this.now();
+    const s = this.players.find(p => p.pid === pid); if (!s) return;
+    if (this.phase === 'LOBBY') this.players = this.players.filter(p => p.pid !== pid);
+    else s.removed = true;
+    this._fixHost(); this._checkEmpty();
+  }
+  _purgeRemoved() { this.players = this.players.filter(p => !p.removed); this._fixHost(); }
+
+  // ---------- เริ่มเกม ----------
+  _startGame() { // R-5-06, R-8-09
+    this._purgeRemoved();
+    const act = this.active();
+    const n = act.length;
+    this.gameNo++;
+    const st = this.settings;
+    this.turnStyle = n >= this.C.SIMUL_MIN_PLAYERS ? 'rounds' : 'turns';
+    this.boardSize = st.mode === 'classic' ? this.C.CLASSIC_BOARD : this.C.SURVIVAL_BOARD[n];
+    const ids = st.mode === 'classic' ? this.C.CLASSIC_FLEET : this.C.SURVIVAL_FLEET[n];
+    this.fleet = ids.map(id => ({ id, name: this._pieceName(id), shape: this.catalog.get(id).shape }));
+    for (const s of act) this._resetSeat(s);
+    this.phase = 'PLACING';
+    this.turnPid = null; this.turnNo = 0; this.roundNo = 0; this.lastResolve = []; this.result = null;
+    this.boards = new Map(); this.elimCount = 0;
+    if (st.islands === 'random') this._randomIslandsAll();                    // R-7-06
+    this.deadline = this.now() + (this.C.PLACE_TIME + (st.islands === 'draw' ? this.C.ISLAND_DRAW_TIME : 0)) * 1000;
+    this._log('game_start', { pids: act.map(p => p.pid), mode: st.mode, n, board: this.boardSize, settings: { ...st } });
   }
 
-  // ---------- เฟส ----------
-  _startGame() { // R-5-05, R-8-08
-    this.gameNo++;
-    for (const s of this.players) this._resetSeat(s);
-    this.phase = 'PLACING';
-    this.turnPid = null; this.turnNo = 0; this.lastShot = null; this.result = null;
-    this.deadline = this.now() + this.C.PLACE_TIME * 1000;
-    this._log('game_start', { pids: this.players.map(p => p.pid) });
+  // ---------- การวาง ----------
+  _pieceAbs(p) { // {pieceId,row,col,rot} -> [[r,c]]
+    const f = this.fleet.find(x => x.id === p.pieceId);
+    return rotateCells(f.shape, p.rot).map(([r, c]) => [r + p.row, c + p.col]);
   }
-  _firstPid() { // R-7-14
-    const pair = this.players.map(p => p.pid).sort().join(',');
-    if (this.prev && this.prev.loserPid && this.prev.pair === pair && this.prev.reason !== 'cancelled') return this.prev.loserPid;
-    return this.players[this.rand() < 0.5 ? 0 : 1].pid;
+  validatePlacement(placement) { // R-7-01..R-7-03 คืน [{id, cells:[key]}]
+    if (!Array.isArray(placement)) throw err('BAD_REQUEST');
+    for (const p of placement) if (!p || typeof p !== 'object' || typeof p.pieceId !== 'string') throw err('BAD_REQUEST');
+    const ids = new Set(this.fleet.map(f => f.id)); const seen = new Set();
+    for (const p of placement) {
+      if (!ids.has(p.pieceId) || seen.has(p.pieceId)) throw err('PLACEMENT_INVALID', 'PIECES');
+      seen.add(p.pieceId);
+    }
+    if (seen.size !== this.fleet.length) throw err('PLACEMENT_INVALID', 'PIECES');
+    for (const p of placement) if (![0, 1, 2, 3].includes(p.rot)) throw err('PLACEMENT_INVALID', 'ROT');
+    const B = this.boardSize; const used = new Set(); const pieces = [];
+    for (const p of placement) {
+      if (!isInt(p.row) || !isInt(p.col)) throw err('PLACEMENT_INVALID', 'BOUNDS');
+      const cells = this._pieceAbs(p);
+      if (cells.some(([r, c]) => r < 0 || c < 0 || r >= B || c >= B)) throw err('PLACEMENT_INVALID', 'BOUNDS');
+      pieces.push({ id: p.pieceId, row: p.row, col: p.col, rot: p.rot, cells: cells.map(([r, c]) => this._key(r, c)) });
+    }
+    for (const pc of pieces) for (const k of pc.cells) {
+      if (used.has(k)) throw err('PLACEMENT_INVALID', 'OVERLAP');                // R-7-03 ของตัวเองห้ามทับ
+      used.add(k);
+    }
+    return pieces;
   }
-  _beginBattle() {
-    this.phase = 'BATTLE';
-    this.turnPid = this._firstPid();
-    this.turnNo = 1;
-    this.deadline = this.now() + this.C.SHOT_TIME * 1000;
-    this._log('battle_start', { firstPid: this.turnPid });
+  _groups(keys) {
+    const set = new Set(keys); const seen = new Set(); const out = [];
+    for (const k of keys) {
+      if (seen.has(k)) continue;
+      const g = []; const q = [k]; seen.add(k);
+      while (q.length) {
+        const x = q.pop(); g.push(x); const [r, c] = this._rc(x);
+        for (const [dr, dc] of NB4) {
+          const rr = r + dr, cc = c + dc;
+          if (rr < 0 || cc < 0 || rr >= this.boardSize || cc >= this.boardSize) continue;
+          const y = this._key(rr, cc);
+          if (set.has(y) && !seen.has(y)) { seen.add(y); q.push(y); }
+        }
+      }
+      out.push(g.sort((a, b) => a - b));
+    }
+    return out;
   }
-  _end(winnerPid, reason) { // R-9-03
-    const loser = winnerPid ? this.players.find(p => p.pid !== winnerPid) : null;
-    this.phase = 'GAME_OVER';
-    this.deadline = null;
-    this.result = { winnerPid: winnerPid || null, reason };
-    this.prev = { loserPid: loser ? loser.pid : null, pair: this.players.map(p => p.pid).sort().join(','), reason };
-    for (const s of this.players) s.wantsRematch = false;
-    this._log('game_end', { winnerPid, reason, turns: this.turnNo });
+  validateIslands(list) { // R-7-05
+    if (!Array.isArray(list) || list.length !== this.C.ISLAND_CELLS) throw err('PLACEMENT_INVALID', 'ISLANDS');
+    const B = this.boardSize; const keys = [];
+    for (const x of list) {
+      if (!Array.isArray(x) || !isInt(x[0]) || !isInt(x[1]) || x[0] < 0 || x[1] < 0 || x[0] >= B || x[1] >= B) throw err('PLACEMENT_INVALID', 'ISLANDS');
+      keys.push(this._key(x[0], x[1]));
+    }
+    if (new Set(keys).size !== keys.length) throw err('PLACEMENT_INVALID', 'ISLANDS');
+    const groups = this._groups(keys);
+    if (groups.some(g => g.length < this.C.ISLAND_MIN_GROUP)) throw err('PLACEMENT_INVALID', 'ISLANDS');
+    return groups;
   }
-  _forfeit(pid, reason) {
-    const o = this.opp(pid);
-    this._end(o ? o.pid : null, o ? reason : 'cancelled');
+  randomPlacement() { // R-7-06, R-3-02 ชิ้นใหญ่ก่อน
+    const B = this.boardSize;
+    const order = [...this.fleet].sort((a, b) => b.shape.length - a.shape.length);
+    for (let set = 0; set < 50; set++) {
+      const used = new Set(); const out = []; let ok = true;
+      for (const f of order) {
+        let placed = false;
+        for (let t = 0; t < 2000 && !placed; t++) {
+          const rot = this._rint(4); const cells = rotateCells(f.shape, rot);
+          const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
+          if (h > B || w > B) continue;
+          const row = this._rint(B - h + 1), col = this._rint(B - w + 1);
+          const ks = cells.map(([r, c]) => this._key(r + row, c + col));
+          if (ks.some(k => used.has(k))) continue;
+          ks.forEach(k => used.add(k)); out.push({ pieceId: f.id, row, col, rot }); placed = true;
+        }
+        if (!placed) { ok = false; break; }
+      }
+      if (ok) return out;
+    }
+    return null;
+  }
+  _randomBlob(size, forbid) {
+    const B = this.boardSize;
+    for (let t = 0; t < 500; t++) {
+      const start = this._key(this._rint(B), this._rint(B));
+      if (forbid(start)) continue;
+      const blob = [start]; const inBlob = new Set(blob);
+      while (blob.length < size) {
+        const front = [];
+        for (const k of blob) {
+          const [r, c] = this._rc(k);
+          for (const [dr, dc] of NB4) {
+            const rr = r + dr, cc = c + dc;
+            if (rr < 0 || cc < 0 || rr >= B || cc >= B) continue;
+            const y = this._key(rr, cc);
+            if (!inBlob.has(y) && !forbid(y)) front.push(y);
+          }
+        }
+        if (!front.length) break;
+        const y = front[this._rint(front.length)]; blob.push(y); inBlob.add(y);
+      }
+      if (blob.length === size) return blob;
+    }
+    return null;
+  }
+  randomIslands(othersCells) { // คืน [[r,c]] ISLAND_CELLS ช่อง กลุ่มละ ISLAND_MIN_GROUP
+    const n = this.C.ISLAND_CELLS, g = this.C.ISLAND_MIN_GROUP;
+    const sizes = []; let left = n;
+    while (left > 0) { const s = left - g < g ? left : g; sizes.push(s); left -= s; }
+    for (let set = 0; set < 50; set++) {
+      const mine = new Set(); let shared = 0; let ok = true;
+      for (const sz of sizes) {
+        const nb = new Set();
+        for (const k of mine) { const [r, c] = this._rc(k); for (const [dr, dc] of NB4) { const rr = r + dr, cc = c + dc; if (rr >= 0 && cc >= 0 && rr < this.boardSize && cc < this.boardSize) nb.add(this._key(rr, cc)); } }
+        let blob = null;
+        for (let t = 0; t < 30 && !blob; t++) {
+          const b = this._randomBlob(sz, k => mine.has(k) || nb.has(k));
+          if (!b) continue;
+          const sh = othersCells ? b.filter(k => othersCells.has(k)).length : 0;
+          if (shared + sh <= this.C.ISLAND_RANDOM_MAX_SHARED) { blob = b; shared += sh; }
+        }
+        if (!blob) { ok = false; break; }
+        blob.forEach(k => mine.add(k));
+      }
+      if (ok) return [...mine].map(k => this._rc(k));
+    }
+    return null;
+  }
+  _randomIslandsAll() {
+    const classic = this.settings.mode === 'classic';
+    const taken = new Set();
+    for (const s of this.active()) {
+      const isl = this.randomIslands(classic ? null : taken);
+      s.islands = isl ? this._groups(isl.map(([r, c]) => this._key(r, c))) : [];
+      if (!classic) s.islands.flat().forEach(k => taken.add(k));
+    }
   }
 
   // ---------- Actions ----------
   action(pid, msg) {
     const s = this._need(pid);
     if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') throw err('BAD_REQUEST');
-    if (msg.reqId != null) { // R-7-11
+    if (msg.reqId != null) { // R-7-16
       if (typeof msg.reqId !== 'string' || msg.reqId.length > 40) throw err('BAD_REQUEST');
       if (s.reqIds.includes(msg.reqId)) return { dup: true };
       s.reqIds.push(msg.reqId); if (s.reqIds.length > this.C.REQID_MEMORY) s.reqIds.shift();
     }
     switch (msg.type) {
+      case 'update_settings': return this._settings(s, msg.settings);
+      case 'start_game': return this._start(s);
       case 'suggest_placement': return this._suggest(s);
-      case 'submit_placement': return this._submit(s, msg.placement);
+      case 'submit_placement': return this._submit(s, msg.placement, msg.islands);
       case 'fire': return this._fire(s, msg);
       case 'resign': return this._resign(s);
       case 'rematch': return this._rematch(s, msg.want);
@@ -250,139 +387,521 @@ class Room {
       default: throw err('BAD_REQUEST');
     }
   }
-  _suggest(s) { // R-7-06
+  _settings(s, v) { // R-5-05
+    if (s.pid !== this.hostPid) throw err('NOT_HOST');
+    if (this.phase !== 'LOBBY' && this.phase !== 'GAME_OVER') throw err('BAD_PHASE');
+    if (!v || typeof v !== 'object') throw err('BAD_REQUEST');
+    const n = { ...this.settings };
+    if ('mode' in v) { if (!['classic', 'survival'].includes(v.mode)) throw err('BAD_REQUEST'); n.mode = v.mode; }
+    if ('bonusOnHit' in v) { if (typeof v.bonusOnHit !== 'boolean') throw err('BAD_REQUEST'); n.bonusOnHit = v.bonusOnHit; }
+    if ('islands' in v) { if (!['off', 'random', 'draw'].includes(v.islands)) throw err('BAD_REQUEST'); n.islands = v.islands; }
+    if ('traps' in v) { if (typeof v.traps !== 'boolean') throw err('BAD_REQUEST'); n.traps = v.traps; }
+    this.settings = n;
+    return {};
+  }
+  _start(s) { // R-5-06
+    if (s.pid !== this.hostPid) throw err('NOT_HOST');
+    if (this.phase !== 'LOBBY') throw err('BAD_PHASE');
+    if (this.active().filter(p => p.connected).length < this.C.MIN_PLAYERS) throw err('NOT_ENOUGH_PLAYERS');
+    this._startGame();
+    return {};
+  }
+  _suggest(s) {
     if (this.phase !== 'PLACING') throw err('BAD_PHASE');
     if (s.ready) throw err('ALREADY_PLACED');
     const t = this.now();
     if (t - s.lastSuggest < this.C.SUGGEST_COOLDOWN * 1000) return { placement: null };
     s.lastSuggest = t;
-    return { placement: randomPlacement(this.fleet, this.rand) };
+    const out = { placement: this.randomPlacement() };
+    if (this.settings.islands === 'draw') out.islands = this.randomIslands(null);
+    return out;
   }
-  _submit(s, placement) { // R-7-05
+  _submit(s, placement, islands) { // R-7-07
     if (this.phase !== 'PLACING') throw err('BAD_PHASE');
     if (s.ready) throw err('ALREADY_PLACED');
-    s.cells = validatePlacement(placement, this.fleet);
-    s.placement = placement.map(p => ({ pieceId: p.pieceId, row: p.row, col: p.col, dir: p.dir }));
+    const pieces = this.validatePlacement(placement);
+    let groups = s.islands;
+    if (this.settings.islands === 'draw') groups = this.validateIslands(islands);
+    s.pieces = pieces.map(p => ({ ...p, sunk: false }));
+    s.placement = placement.map(p => ({ pieceId: p.pieceId, row: p.row, col: p.col, rot: p.rot }));
+    s.islands = groups;
     s.ready = true;
     this._log('placed', { pid: s.pid, auto: false });
-    if (this.players.length === 2 && this.players.every(p => p.ready)) this._beginBattle();
+    this._maybeBattle();
     return {};
+  }
+  _autoPlace(s) { // R-8-01
+    const pl = this.randomPlacement();
+    if (!pl) return false;
+    s.pieces = this.validatePlacement(pl).map(p => ({ ...p, sunk: false }));
+    s.placement = pl;
+    if (this.settings.islands === 'draw') {
+      const isl = this.randomIslands(null);
+      s.islands = isl ? this._groups(isl.map(([r, c]) => this._key(r, c))) : [];
+    }
+    s.ready = true;
+    this._log('placed', { pid: s.pid, auto: true });
+    return true;
+  }
+  _maybeBattle() {
+    const al = this.alive();
+    if (al.length >= 2 && al.every(p => p.ready)) this._beginBattle();
+  }
+
+  // ---------- กระดาน ----------
+  _boardIds() { return this.settings.mode === 'classic' ? this.active().map(p => p.pid) : ['*']; }
+  _beginBattle() {
+    this.phase = 'BATTLE';
+    const B = this.boardSize;
+    for (const id of this._boardIds()) this.boards.set(id, { shot: new Map(), traps: new Set(), trapsHit: new Set() });
+    if (this.settings.traps) { // R-7-60
+      const nTrap = Math.max(1, Math.round(this.C.TRAP_RATE * B * B));
+      for (const [id, bd] of this.boards) {
+        const occ = new Set();
+        for (const p of this.alive()) {
+          if (id !== '*' && p.pid !== id) continue;
+          p.pieces.forEach(pc => pc.cells.forEach(k => occ.add(k)));
+          p.islands.flat().forEach(k => occ.add(k));
+        }
+        const free = []; for (let k = 0; k < B * B; k++) if (!occ.has(k)) free.push(k);
+        for (let i = 0; i < nTrap && free.length; i++) bd.traps.add(free.splice(this._rint(free.length), 1)[0]);
+      }
+    }
+    this._log('battle_start', { style: this.turnStyle });
+    if (this.turnStyle === 'turns') {
+      this.turnPid = this._firstPid();
+      this.turnNo = 1;
+      this.deadline = this.now() + this.C.SHOT_TIME * 1000;
+    } else this._beginRound();
+  }
+  _firstPid() { // R-7-10
+    const al = this.alive();
+    const pair = al.map(p => p.pid).sort().join(',');
+    if (this.prev && this.prev.loserPid && this.prev.pair === pair && al.some(p => p.pid === this.prev.loserPid)) return this.prev.loserPid;
+    return al[this._rint(al.length)].pid;
+  }
+  // เจ้าของในช่อง (เฉพาะผู้รอด ณ ตอนนั้น)
+  _occupants(boardId, k, aliveSet) {
+    const pieces = []; const islands = [];
+    for (const p of this.players) {
+      if (!aliveSet.has(p.pid)) continue;
+      if (boardId !== '*' && p.pid !== boardId) continue;
+      p.pieces.forEach((pc, i) => { if (pc.cells.includes(k)) pieces.push({ pid: p.pid, idx: i }); });
+      p.islands.forEach((g, i) => { if (g.includes(k)) islands.push({ pid: p.pid, idx: i }); });
+    }
+    return { pieces, islands };
+  }
+  // ตัดสินชุดนัด (turns: 1 นัด, rounds: ทุกนัดของรอบ) R-7-20..R-7-26
+  // shots: [{shooter, board, cells:[k], auto}]
+  _resolve(shots) {
+    const aliveSet = new Set(this.alive().map(p => p.pid));
+    const byCell = new Map(); // "board|k" -> [shotIdx]
+    shots.forEach((sh, i) => sh.cells.forEach(k => {
+      const id = sh.board + '|' + k; if (!byCell.has(id)) byCell.set(id, []); byCell.get(id).push(i);
+    }));
+    const per = shots.map(() => ({ bonusHit: false, islandOther: false, trap: false, cells: [] }));
+    const hitPieces = []; // {pid, idx}
+    const touchedIslands = [];
+    for (const [id, idxs] of byCell) {
+      const [board, ks] = id.split('|'); const k = Number(ks);
+      const bd = this.boards.get(board);
+      const occ = this._occupants(board, k, aliveSet);
+      let pub;
+      if (bd.traps.has(k)) { pub = 'trap'; bd.trapsHit.add(k); }
+      else if (occ.pieces.length && occ.islands.length) pub = 'island_hit';
+      else if (occ.pieces.length) pub = 'hit';
+      else if (occ.islands.length) pub = 'island';
+      else pub = 'miss';
+      bd.shot.set(k, pub);
+      occ.pieces.forEach(x => hitPieces.push(x));
+      occ.islands.forEach(x => touchedIslands.push({ ...x, board }));
+      // แจ้งเตือนส่วนตัว R-4-04
+      for (const x of occ.pieces) this._notice(x.pid, 'my_hit', `${this._pieceName(this.seat(x.pid).pieces[x.idx].id)}ของคุณโดนยิง`, { board, cell: this._rc(k) });
+      for (const ipid of new Set(occ.islands.map(x => x.pid))) this._notice(ipid, 'my_island', 'เกาะของคุณโดนยิง', { board, cell: this._rc(k) });
+      for (const i of idxs) {
+        const sh = shots[i];
+        per[i].cells.push([...this._rc(k), pub]);
+        if (pub === 'trap') per[i].trap = true;
+        if (occ.pieces.some(x => x.pid !== sh.shooter)) per[i].bonusHit = true;            // R-7-40
+        if (occ.islands.some(x => x.pid !== sh.shooter)) per[i].islandOther = true;        // R-7-51
+      }
+    }
+    // ชิ้นดับ (หลังทุกนัดในชุด) R-7-21
+    const sunkNow = [];
+    for (const p of this.players) {
+      if (!aliveSet.has(p.pid)) continue;
+      const bd = this.boards.get(this.settings.mode === 'classic' ? p.pid : '*');
+      p.pieces.forEach((pc, i) => {
+        if (pc.sunk || !pc.cells.every(k => bd.shot.has(k))) return;
+        pc.sunk = true; sunkNow.push({ ownerPid: p.pid, pieceId: pc.id, row: pc.row, col: pc.col, rot: pc.rot, cells: pc.cells.map(k => this._rc(k)) });
+        this._notice('all', 'sunk', `${this._pieceName(pc.id)}ของ ${p.name} ดับแล้ว!`, { ownerPid: p.pid, pieceId: pc.id });
+      });
+    }
+    // เกาะครบ R-7-53, R-7-54
+    const doneIsl = new Set();
+    for (const x of touchedIslands) {
+      const key = x.pid + ':' + x.idx; if (doneIsl.has(key)) continue;
+      const owner = this.seat(x.pid); const g = owner && owner.islands[x.idx];
+      const bd = this.boards.get(x.board);
+      if (!g || !g.every(k => bd.shot.has(k))) continue;
+      doneIsl.add(key);
+      shots.forEach((sh, i) => {
+        if (sh.shooter === x.pid) return;
+        if (!sh.cells.some(k => g.includes(k)) || sh.board !== x.board) return;
+        const sp = this.seat(sh.shooter); if (!sp || sp.doubleBonus) return;
+        sp.doubleBonus = true;
+        this._notice('all', 'island_bonus', this.settings.mode === 'classic'
+          ? `${sp.name} ทำลายเกาะของ ${owner.name} ครบ ได้นัดคู่!` : `${sp.name} ทำลายเกาะครบ ได้นัดคู่!`, { pid: sp.pid });
+      });
+    }
+    // สถิติ + hitsOnOthers (R-9-03)
+    shots.forEach((sh, i) => {
+      const sp = this.seat(sh.shooter); if (!sp) return;
+      sp.shots++; if (per[i].bonusHit) sp.hits++;
+      if (per[i].bonusHit && !sh.auto) sp.hitsOnOthers++;
+      if (per[i].islandOther) this._notice(sp.pid, 'you_island', 'โดนเกาะ!');
+      if (per[i].trap) { sp.skipNext = true; this._notice(sp.pid, 'you_trap', 'โดนกับดัก! ข้ามตาหน้า'); this._notice('all', 'trap', `${sp.name} โดนกับดัก`, { pid: sp.pid }); }
+    });
+    this.lastResolve = shots.map((sh, i) => ({ shooterPid: sh.shooter, board: sh.board, cells: per[i].cells, auto: !!sh.auto, double: sh.cells.length > 1 }));
+    this.lastSunk = sunkNow;
+    this._log('resolve', { shots: this.lastResolve, sunk: sunkNow.map(x => x.ownerPid + ':' + x.pieceId) });
+    // ตกรอบ R-7-22
+    const elim = this.alive().filter(p => p.pieces.length && p.pieces.every(pc => pc.sunk));
+    return { per, elim };
+  }
+  _eliminate(list, reason) {
+    if (!list.length) return;
+    this.elimCount++;
+    for (const p of list) {
+      p.alive = false; p.elimAt = this.elimCount; p.elimReason = reason;
+      this._notice('all', 'elim', `${p.name} ตกรอบ`, { pid: p.pid });
+    }
+    this._log('eliminated', { pids: list.map(p => p.pid), reason });
+  }
+  // ตรวจจบเกมหลังมีคนตกรอบ (R-9-01..R-9-03, R-8-08)
+  _checkEnd(batch, foul) {
+    const al = this.alive();
+    if (al.length === 1) return this._end(al[0].pid, 'last_standing'), true;
+    if (al.length === 0) {
+      if (foul) return this._end(null, 'cancelled'), true;
+      if (this.settings.mode === 'survival') {
+        const best = Math.max(...batch.map(p => p.hitsOnOthers));
+        const top = batch.filter(p => p.hitsOnOthers === best);
+        if (top.length === 1) return this._end(top[0].pid, 'tiebreak_hits'), true;
+      }
+      return this._end(null, 'draw'), true;
+    }
+    return false;
+  }
+  _end(winnerPid, reason) {
+    this.phase = 'GAME_OVER'; this.deadline = null;
+    const ranks = []; // R-9-04
+    const ps = this.players.filter(p => p.ready || p.elimAt != null);
+    const key = p => (p.pid === winnerPid ? Infinity : p.alive ? Infinity - 1 : p.elimAt || 0);
+    const sorted = [...ps].sort((a, b) => key(b) - key(a));
+    let rank = 0, last = null;
+    sorted.forEach((p, i) => { const kv = key(p); if (kv !== last) { rank = i + 1; last = kv; } ranks.push({ pid: p.pid, rank }); });
+    this.result = { winnerPid: winnerPid || null, reason, ranking: ranks,
+      hitsOnOthers: Object.fromEntries(ps.map(p => [p.pid, p.hitsOnOthers])) };
+    const al2 = this.active();
+    const loser = winnerPid && al2.length === 2 ? al2.find(p => p.pid !== winnerPid) : null;
+    this.prev = { loserPid: loser ? loser.pid : null, pair: al2.map(p => p.pid).sort().join(',') };
+    for (const s of this.players) s.wantsRematch = false;
+    this._notice('all', 'game_end', winnerPid ? `${this.seat(winnerPid)?.name || ''} ชนะ!` : (reason === 'draw' ? 'เสมอ' : 'เกมถูกยกเลิก'));
+    this._log('game_end', { winnerPid, reason, turns: this.turnNo, rounds: this.roundNo });
+  }
+
+  // ---------- การยิง ----------
+  _parseShots(s, msg) {
+    if (!Array.isArray(msg.shots) || !msg.shots.length) throw err('BAD_REQUEST');
+    const B = this.boardSize; const out = []; const used = new Set();
+    msg.shots.forEach((x, i) => {
+      if (!x || typeof x !== 'object' || typeof x.row !== 'number' || typeof x.col !== 'number') throw err('BAD_REQUEST');
+      if (!isInt(x.row) || !isInt(x.col) || x.row < 0 || x.col < 0 || x.row >= B || x.col >= B) throw err('OUT_OF_BOUNDS');
+      let board = '*';
+      if (this.settings.mode === 'classic') {                                                        // R-7-15
+        const t = this.seat(x.board);
+        if (typeof x.board !== 'string' || !t || !t.alive || t.pid === s.pid) throw err('BAD_TARGET');
+        board = t.pid;
+      }
+      const bd = this.boards.get(board);
+      const cells = [this._key(x.row, x.col)];
+      const wantDouble = i === 0 && s.doubleBonus;
+      if (x.double != null || wantDouble) {                                                        // R-7-53
+        if (!s.doubleBonus || i !== 0) throw err('DOUBLE_INVALID');
+        if (x.double == null) { if (this._anyDouble(board)) throw err('DOUBLE_INVALID'); }
+        else {
+          if (x.double !== 'H' && x.double !== 'V') throw err('DOUBLE_INVALID');
+          const r2 = x.row + (x.double === 'V' ? 1 : 0), c2 = x.col + (x.double === 'H' ? 1 : 0);
+          if (r2 >= B || c2 >= B || bd.shot.has(this._key(r2, c2))) {
+            if (this._anyDouble(board)) throw err('DOUBLE_INVALID');
+          } else cells.push(this._key(r2, c2));
+        }
+      }
+      for (const k of cells) {
+        if (bd.shot.has(k) || used.has(board + '|' + k)) throw err('ALREADY_SHOT');                 // R-7-14
+        used.add(board + '|' + k);
+      }
+      out.push({ shooter: s.pid, board, cells, auto: false });
+    });
+    return out;
+  }
+  _anyDouble(board) {
+    const bd = this.boards.get(board); const B = this.boardSize;
+    for (let r = 0; r < B; r++) for (let c = 0; c < B; c++) {
+      if (bd.shot.has(this._key(r, c))) continue;
+      if ((c + 1 < B && !bd.shot.has(this._key(r, c + 1))) || (r + 1 < B && !bd.shot.has(this._key(r + 1, c)))) return true;
+    }
+    return false;
   }
   _fire(s, msg) {
-    if (this.phase !== 'BATTLE') throw err('BAD_PHASE');                       // R-7-07
-    if (msg.turnNo !== this.turnNo) throw err('STALE_TURN');                   // R-7-10
-    if (this.turnPid !== s.pid) throw err('NOT_YOUR_TURN');                    // R-7-07
-    if (typeof msg.row !== 'number' || typeof msg.col !== 'number') throw err('BAD_REQUEST');
-    if (!isInt(msg.row) || !isInt(msg.col) || msg.row < 0 || msg.row >= N || msg.col < 0 || msg.col >= N) throw err('OUT_OF_BOUNDS'); // R-7-08
-    if (s.shotsTaken.has(key(msg.row, msg.col))) throw err('ALREADY_SHOT');   // R-7-09
-    s.autoStreak = 0;                                                           // R-7-16
-    this._shot(s, msg.row, msg.col, false);
+    if (this.phase !== 'BATTLE') throw err('BAD_PHASE');
+    if (msg.turnNo !== this.turnNo) throw err('STALE_TURN');                                       // R-7-16
+    if (!s.alive) throw err('NOT_YOUR_TURN');
+    if (this.turnStyle === 'turns') {
+      if (this.turnPid !== s.pid) throw err('NOT_YOUR_TURN');                                      // R-7-13
+      if (!Array.isArray(msg.shots) || msg.shots.length !== 1) throw err('SHOT_COUNT');
+      const shots = this._parseShots(s, msg);
+      s.autoStreak = 0;                                                                           // R-7-71
+      this._turnShot(s, shots[0]);
+    } else {
+      if (!this.roundShooters.has(s.pid)) throw err('NOT_YOUR_TURN');
+      if (s.pending) throw err('ALREADY_SUBMITTED');
+      if (!Array.isArray(msg.shots) || msg.shots.length !== s.shotsAllowed) throw err('SHOT_COUNT'); // R-7-12
+      s.pending = this._parseShots(s, msg);
+      s.autoStreak = 0;
+      if ([...this.roundShooters].every(pid => { const p = this.seat(pid); return !p || !p.alive || p.pending; })) this._resolveRound();
+    }
     return {};
   }
-  _shot(s, row, col, auto) { // R-7-12, R-7-13, R-9-01
-    const o = this.opp(s.pid);
-    const k = key(row, col);
-    const pieceId = o.cells.get(k);
-    const result = pieceId ? 'hit' : 'miss';
-    s.shotsTaken.set(k, result);
-    let sunkPieceId = null;
-    if (pieceId) {
-      const all = [...o.cells.entries()].filter(([, id]) => id === pieceId).map(([c]) => c);
-      if (all.every(c => s.shotsTaken.get(c) === 'hit')) { sunkPieceId = pieceId; o.sunk.push(pieceId); }
+  _consumeDouble(s, shot) { if (s.doubleBonus) s.doubleBonus = false; return shot; }
+
+  // --- turns (2 คน) ---
+  _turnShot(s, shot) {
+    this._consumeDouble(s, shot);
+    const { per, elim } = this._resolve([shot]);
+    this._eliminate(elim, 'sunk');
+    if (elim.length && this._checkEnd(elim, false)) return;
+    const r = per[0];
+    let again = false;
+    if (!shot.auto && !r.trap) {                                                                   // R-7-41, R-7-52, R-7-61
+      if (this.settings.bonusOnHit && r.bonusHit) again = true;
+      if (r.islandOther) again = true;
     }
-    this.lastShot = { shooterPid: s.pid, row, col, result, sunkPieceId, auto, turnNo: this.turnNo };
-    this._log('shot', { pid: s.pid, row, col, result, sunkPieceId, auto });
-    if (o.sunk.length === this.fleet.length) return this._end(s.pid, 'all_sunk');
-    if (auto && s.autoStreak >= this.C.AUTO_SHOT_LIMIT) return this._forfeit(s.pid, 'auto_limit'); // R-8-03
-    this.turnPid = o.pid; this.turnNo++;
+    if (shot.auto && s.autoStreak >= this.C.AUTO_SHOT_LIMIT) {                                     // R-8-04
+      this._eliminate([s], 'auto_limit');
+      if (this._checkEnd([s], true)) return;
+    }
+    this.turnNo++;
+    if (again && s.alive) { this.deadline = this.now() + this.C.SHOT_TIME * 1000; return; }
+    this._nextTurn(s.pid);
+  }
+  _nextTurn(fromPid) {
+    const al = this.alive(); if (al.length < 2) return;
+    if (al.every(p => p.skipNext)) al.forEach(p => { p.skipNext = false; });                        // R-7-63
+    const order = this.players.filter(p => p.alive && !p.removed);
+    let i = order.findIndex(p => p.pid === fromPid);
+    for (let step = 0; step < order.length * 2; step++) {
+      i = (i + 1) % order.length;
+      const p = order[i];
+      if (p.skipNext) { p.skipNext = false; this._notice('all', 'skip', `${p.name} ถูกข้ามตา`, { pid: p.pid }); continue; } // R-7-62
+      this.turnPid = p.pid; break;
+    }
     this.deadline = this.now() + this.C.SHOT_TIME * 1000;
   }
-  _resign(s) { // R-7-15
+
+  // --- rounds (3+ คน) ---
+  _beginRound() {
+    this.roundNo++; this.turnNo++;
+    const al = this.alive();
+    if (al.every(p => p.skipNext)) al.forEach(p => { p.skipNext = false; });                        // R-7-63
+    this.roundShooters = new Set();
+    for (const p of al) {
+      p.pending = null;
+      if (p.skipNext) { p.skipNext = false; p.skippedRound = this.roundNo; this._notice('all', 'skip', `${p.name} ถูกข้ามรอบนี้`, { pid: p.pid }); continue; }
+      this.roundShooters.add(p.pid);
+    }
+    const two = [...this.roundShooters].some(pid => this.seat(pid).shotsAllowed > 1);
+    this.deadline = this.now() + (two ? this.C.ROUND_TIME_DOUBLE : this.C.SHOT_TIME) * 1000;       // R-8-03
+  }
+  _autoShots(s, count) { // R-8-02 / R-8-03 สุ่มช่องที่ยังไม่ถูกยิง
+    const out = []; const used = new Set();
+    for (let i = 0; i < count; i++) {
+      let board = '*';
+      if (this.settings.mode === 'classic') {
+        const opts = this.alive().filter(p => p.pid !== s.pid && this._freeCells(p.pid, used).length);
+        if (!opts.length) break;
+        board = opts[this._rint(opts.length)].pid;
+      }
+      const free = this._freeCells(board, used); if (!free.length) break;
+      const k = free[this._rint(free.length)];
+      const cells = [k];
+      if (i === 0 && s.doubleBonus) {
+        const [r, c] = this._rc(k); const bd = this.boards.get(board); const B = this.boardSize;
+        const opts = [];
+        if (c + 1 < B && !bd.shot.has(k + 1) && !used.has(board + '|' + (k + 1))) opts.push(k + 1);
+        if (r + 1 < B && !bd.shot.has(k + B) && !used.has(board + '|' + (k + B))) opts.push(k + B);
+        if (opts.length) cells.push(opts[this._rint(opts.length)]);
+      }
+      cells.forEach(x => used.add(board + '|' + x));
+      out.push({ shooter: s.pid, board, cells, auto: true });
+    }
+    return out;
+  }
+  _freeCells(board, used) {
+    const bd = this.boards.get(board); const B = this.boardSize; const out = [];
+    for (let k = 0; k < B * B; k++) if (!bd.shot.has(k) && !used.has(board + '|' + k)) out.push(k);
+    return out;
+  }
+  _resolveRound() {
+    const shooters = [...this.roundShooters].map(pid => this.seat(pid)).filter(p => p && p.alive);
+    const all = [];
+    const autoPids = new Set();
+    for (const p of shooters) {
+      if (!p.pending) { p.pending = this._autoShots(p, p.shotsAllowed); p.autoStreak++; autoPids.add(p.pid); }
+      if (p.doubleBonus && p.pending.length) p.doubleBonus = false;
+      all.push(...p.pending);
+    }
+    const { per, elim } = this._resolve(all);
+    // สิทธิ์ 2 นัดรอบหน้า R-7-42, R-7-52, R-7-43
+    for (const p of shooters) {
+      let two = false;
+      all.forEach((sh, i) => {
+        if (sh.shooter !== p.pid || sh.auto) return;
+        if ((this.settings.bonusOnHit && per[i].bonusHit) || per[i].islandOther) two = true;
+      });
+      p.shotsAllowed = two ? Math.min(2, this.C.MAX_SHOTS_PER_ROUND) : 1;
+      p.pending = null;
+    }
+    this._eliminate(elim, 'sunk');
+    if (elim.length && this._checkEnd(elim, false)) return;
+    const fouls = shooters.filter(p => p.alive && autoPids.has(p.pid) && p.autoStreak >= this.C.AUTO_SHOT_LIMIT);
+    if (fouls.length) { this._eliminate(fouls, 'auto_limit'); if (this._checkEnd(fouls, true)) return; }
+    this._beginRound();
+  }
+
+  // ---------- อื่น ๆ ----------
+  _resign(s) {
     if (this.phase !== 'PLACING' && this.phase !== 'BATTLE') throw err('BAD_PHASE');
-    this._forfeit(s.pid, 'resign');
+    if (!s.alive) throw err('BAD_PHASE');
+    this._foul([s], 'resign');
     return {};
   }
-  _rematch(s, want) { // R-8-08
+  _foul(list, reason) { // R-7-70, R-8-06, R-8-08
+    if (this.phase === 'PLACING') {
+      for (const p of list) { p.alive = false; p.elimReason = reason; this.elimCount++; p.elimAt = this.elimCount; }
+      const al = this.alive();
+      if (al.length <= 1) { this._end(al.length ? al[0].pid : null, al.length ? 'last_standing' : 'cancelled'); return; }
+      this._maybeBattle(); return;
+    }
+    if (this.phase !== 'BATTLE') return;
+    this._eliminate(list.filter(p => p.alive), reason);
+    if (this._checkEnd(list, true)) return;
+    if (this.turnStyle === 'turns' && list.some(p => p.pid === this.turnPid)) { this.turnNo++; this._nextTurn(this.turnPid); }
+    if (this.turnStyle === 'rounds' && [...this.roundShooters].every(pid => { const p = this.seat(pid); return !p || !p.alive || p.pending; })) {
+      if ([...this.roundShooters].some(pid => { const p = this.seat(pid); return p && p.alive; })) this._resolveRound();
+      else this._beginRound();
+    }
+  }
+  _rematch(s, want) { // R-8-09
     if (this.phase !== 'GAME_OVER') throw err('BAD_PHASE');
-    if (this.players.length < 2) throw err('NO_OPPONENT');
     s.wantsRematch = want !== false;
-    if (this.players.every(p => p.wantsRematch)) this._startGame();
+    const act = this.active();
+    if (act.length >= this.C.MIN_PLAYERS && act.every(p => p.wantsRematch)) this._startGame();
     return {};
   }
   _backToLobby(s) {
-    if (this.phase !== 'GAME_OVER' || this.players.length !== 1) throw err('BAD_PHASE');
-    this.phase = 'LOBBY'; this.result = null; this.lastShot = null; this.deadline = null;
-    this._resetSeat(s);
+    if (this.phase !== 'GAME_OVER') throw err('BAD_PHASE');
+    if (s.pid !== this.hostPid) throw err('NOT_HOST');
+    this.phase = 'LOBBY'; this.result = null; this.lastResolve = []; this.deadline = null; this.boards = new Map();
+    this._purgeRemoved();
+    for (const p of this.active()) this._resetSeat(p);
     return {};
   }
   leave(pid) { // R-8-06
     const s = this.seat(pid); if (!s) return;
-    if (this.phase === 'PLACING' || this.phase === 'BATTLE') this._forfeit(pid, 'resign');
+    this._log('leave', { pid });
+    if ((this.phase === 'PLACING' || this.phase === 'BATTLE') && s.alive) this._foul([s], 'resign');
     this._removeSeat(pid);
     if (this.phase === 'GAME_OVER') for (const p of this.players) p.wantsRematch = false;
-    this._log('leave', { pid });
   }
 
-  // ---------- เวลา (เรียกจาก server ทุก ~0.5 วินาที) ----------
+  // ---------- เวลา (server เรียกทุก ~0.5 วิ) ----------
   tick() {
-    const t = this.now();
-    let changed = false;
-    // R-8-04 / R-8-07 หลุดเกินกำหนด ตรวจทุกคนในรอบเดียวกัน
-    const gone = this.players.filter(p => !p.connected && p.disconnectedAt != null && t - p.disconnectedAt >= this.C.RECONNECT_GRACE * 1000);
+    const t = this.now(); let changed = false;
+    const gone = this.active().filter(p => !p.connected && p.disconnectedAt != null && t - p.disconnectedAt >= this.C.RECONNECT_GRACE * 1000);
     if (gone.length) {
-      if (this.phase === 'PLACING' || this.phase === 'BATTLE') {
-        if (gone.length === this.players.length) this._end(null, 'cancelled');
-        else this._forfeit(gone[0].pid, 'disconnect');
-      }
+      const inGame = this.phase === 'PLACING' || this.phase === 'BATTLE';
+      const aliveGone = gone.filter(p => p.alive);
+      gone.forEach(p => this._log('leave', { pid: p.pid, reason: 'disconnect' }));
+      if (inGame && aliveGone.length) this._foul(aliveGone, 'disconnect');
       for (const g of gone) this._removeSeat(g.pid);
       if (this.phase === 'GAME_OVER') for (const p of this.players) p.wantsRematch = false;
-      if (this.phase === 'LOBBY' && this.players.length === 0) this.deadline = null;
       changed = true;
     }
     if (this.phase === 'PLACING' && t >= this.deadline) { // R-8-01
-      for (const s of this.players) if (!s.ready) {
-        const pl = randomPlacement(this.fleet, this.rand);
-        s.cells = validatePlacement(pl, this.fleet); s.placement = pl; s.ready = true;
-        this._log('placed', { pid: s.pid, auto: true });
-      }
-      if (this.players.length === 2) this._beginBattle();
-      changed = true;
-    } else if (this.phase === 'BATTLE' && t >= this.deadline) { // R-8-02
-      const s = this.seat(this.turnPid);
-      const free = [];
-      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (!s.shotsTaken.has(key(r, c))) free.push([r, c]);
-      const [r, c] = free[Math.floor(this.rand() * free.length)];
-      s.autoStreak++;
-      this._shot(s, r, c, true);
+      for (const s of this.alive()) if (!s.ready && !this._autoPlace(s)) { this._end(null, 'cancelled'); return true; }
+      this._maybeBattle(); changed = true;
+    } else if (this.phase === 'BATTLE' && t >= this.deadline) {
+      if (this.turnStyle === 'turns') { // R-8-02
+        const s = this.seat(this.turnPid);
+        const shot = this._autoShots(s, 1)[0];
+        s.autoStreak++;
+        this._turnShot(s, shot);
+      } else this._resolveRound(); // R-8-03
       changed = true;
     }
     return changed;
   }
-  expired() { // R-8-09
-    return this.emptySince != null && this.now() - this.emptySince >= this.C.ROOM_IDLE_CLOSE * 1000;
-  }
+  expired() { return this.emptySince != null && this.now() - this.emptySince >= this.C.ROOM_IDLE_CLOSE * 1000; }
 
-  // ---------- สิ่งที่ผู้เล่นเห็น (หัวข้อ 4, R-4-01..R-4-04) ----------
+  // ---------- สิ่งที่ผู้เล่นเห็น (หัวข้อ 4, R-4-01..R-4-09) ----------
   getState(pid) {
-    const t = this.now();
-    const reveal = this.phase === 'GAME_OVER';
+    const t = this.now(); const reveal = this.phase === 'GAME_OVER';
+    const me = this.seat(pid);
+    const boards = [];
+    for (const [id, bd] of this.boards) {
+      boards.push({
+        id, cells: [...bd.shot.entries()].map(([k, v]) => [...this._rc(k), v]),
+        traps: reveal ? [...bd.traps].map(k => this._rc(k)) : undefined,
+      });
+    }
+    const C = this.C;
     return {
-      code: this.code, phase: this.phase, gameNo: this.gameNo,
-      you: pid, turnPid: this.turnPid, turnNo: this.turnNo,
+      code: this.code, phase: this.phase, gameNo: this.gameNo, you: pid, hostPid: this.hostPid,
+      settings: { ...this.settings }, turnStyle: this.turnStyle, boardSize: this.boardSize,
+      fleet: this.fleet.map(f => f.id),
+      turnPid: this.turnPid, turnNo: this.turnNo, roundNo: this.roundNo,
       deadline: this.deadline, serverNow: t,
-      lastShot: this.lastShot, result: this.result,
-      config: { SHOT_TIME: this.C.SHOT_TIME, PLACE_TIME: this.C.PLACE_TIME, RECONNECT_GRACE: this.C.RECONNECT_GRACE, SUNK_BANNER_MS: this.C.SUNK_BANNER_MS },
-      players: this.players.map(p => ({
-        pid: p.pid, name: p.name, connected: p.connected, ready: p.ready,
-        wantsRematch: p.wantsRematch, autoStreak: p.autoStreak,
+      lastResolve: this.lastResolve.map(x => ({ ...x })), lastSunk: this.lastSunk || [],
+      result: this.result,
+      boards,
+      config: {
+        SHOT_TIME: C.SHOT_TIME, PLACE_TIME: C.PLACE_TIME, RECONNECT_GRACE: C.RECONNECT_GRACE, ISLAND_CELLS: C.ISLAND_CELLS,
+        ISLAND_MIN_GROUP: C.ISLAND_MIN_GROUP, ANIM_BULLET_MS: C.ANIM_BULLET_MS, ANIM_EFFECT_MS: C.ANIM_EFFECT_MS,
+        SUNK_REVEAL_MS: C.SUNK_REVEAL_MS, MIN_PLAYERS: C.MIN_PLAYERS, MAX_PLAYERS: C.MAX_PLAYERS,
+      },
+      players: this.players.filter(p => !p.removed || reveal).map(p => ({
+        pid: p.pid, name: p.name, color: p.color, connected: p.connected, ready: p.ready, alive: p.alive,
+        removed: !!p.removed, wantsRematch: p.wantsRematch, autoStreak: p.autoStreak,
+        shotsAllowed: p.shotsAllowed, doubleBonus: p.doubleBonus, skipNext: p.skipNext,
+        submitted: this.turnStyle === 'rounds' && this.phase === 'BATTLE' ? !!p.pending : false,
+        shooting: this.turnStyle === 'rounds' && this.phase === 'BATTLE' && this.roundShooters ? this.roundShooters.has(p.pid) : p.pid === this.turnPid,
         graceLeft: p.connected || p.disconnectedAt == null ? null
-          : Math.max(0, Math.ceil((this.C.RECONNECT_GRACE * 1000 - (t - p.disconnectedAt)) / 1000)),
-        shotsTaken: [...p.shotsTaken.entries()].map(([k, res]) => ({ row: Math.floor(k / N), col: k % N, result: res })),
-        sunk: [...p.sunk],
+          : Math.max(0, Math.ceil((C.RECONNECT_GRACE * 1000 - (t - p.disconnectedAt)) / 1000)),
+        sunk: p.pieces.filter(pc => pc.sunk).map(pc => ({ pieceId: pc.id, row: pc.row, col: pc.col, rot: pc.rot, cells: pc.cells.map(k => this._rc(k)) })),
+        stats: reveal ? { shots: p.shots, hits: p.hits, hitsOnOthers: p.hitsOnOthers } : undefined,
         placement: (p.pid === pid || reveal) && p.placement ? p.placement.map(x => ({ ...x })) : null,
+        islands: (p.pid === pid || reveal) ? p.islands.map(g => g.map(k => this._rc(k))) : null,
       })),
+      me: me ? {
+        hitsOnMe: me.pieces.flatMap(pc => pc.cells.filter(k => {
+          const bd = this.boards.get(this.settings.mode === 'classic' ? me.pid : '*'); return bd && bd.shot.has(k);
+        }).map(k => [...this._rc(k), pc.id])),
+        pending: me.pending ? me.pending.map(sh => ({ board: sh.board, cells: sh.cells.map(k => this._rc(k)) })) : null,
+      } : null,
     };
   }
 }
 
-module.exports = { Room, GameError, CONFIG, validateConfig, validatePlacement, randomPlacement };
+module.exports = { Room, GameError, CONFIG, validateConfig, parseShape, rotateCells };

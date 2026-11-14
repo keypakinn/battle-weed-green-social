@@ -10,19 +10,18 @@ const { loadCards } = require('./server/cards');
 process.on('uncaughtException', e => console.error('[uncaught]', e));
 process.on('unhandledRejection', e => console.error('[unhandled]', e));
 
-// R-3-01
-const cfgErrors = validateConfig(CONFIG);
-if (cfgErrors.length) { cfgErrors.forEach(e => console.error('[config] ' + e)); process.exit(1); }
-
 const CARDS_DIR = path.join(__dirname, 'cards');
-const CARDS = loadCards(CARDS_DIR, CONFIG);
-console.log(CARDS.ready ? `[cards] โหลด ${CARDS.cards.length} ใบ version ${CARDS.version}` : `[cards] ไม่พร้อม: ${CARDS.problem}`);
+const CARDS = loadCards(CARDS_DIR);
+console.log(CARDS.ready ? `[cards] โหลด ${CARDS.cards.length} ชิ้น version ${CARDS.version}` : `[cards] ไม่พร้อม: ${CARDS.problem}`);
+
+// R-3-01 (ตรวจ fleet กับ catalog ด้วยเมื่อข้อมูลชิ้นพร้อม)
+const cfgErrors = validateConfig(CONFIG, CARDS.ready ? CARDS.cards.map(c => c.id) : null);
+if (cfgErrors.length) { cfgErrors.forEach(e => console.error('[config] ' + e)); process.exit(1); }
 
 const app = express();
 app.disable('x-powered-by');
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
-app.get('/api/cards', (req, res) => res.json({ version: CARDS.version, templates: CARDS.templates, cards: CARDS.cards }));
-app.get('/preview', (req, res) => res.sendFile(path.join(__dirname, 'public', 'preview.html')));
+app.get('/api/cards', (req, res) => res.json({ version: CARDS.version, cards: CARDS.cards, fit: CARDS.fit }));
 app.use('/cards', express.static(CARDS_DIR, { maxAge: '30d' }));
 app.use('/shared', express.static(path.join(__dirname, 'shared')));
 app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
@@ -52,10 +51,14 @@ function scheduleBroadcast(room) {
   });
 }
 function broadcast(room) {
+  const notices = room.drainNotices(); // 'all' = ทุกคนในห้อง, pid = ส่วนตัว (R-4-04, R-10-05)
   for (const [sid, info] of sockRoom) {
     if (info.code !== room.code) continue;
     const s = io.sockets.sockets.get(sid);
-    if (s && room.seat(info.pid)) s.emit('state', room.getState(info.pid));
+    if (!s || !room.seat(info.pid)) continue;
+    s.emit('state', room.getState(info.pid));
+    const mine = notices.filter(n => n.to === 'all' || n.to === info.pid).map(({ to, ...n }) => n);
+    if (mine.length) s.emit('notice', mine);
   }
 }
 function socketsOf(code, pid) {
@@ -131,7 +134,7 @@ io.on('connection', socket => {
     if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่');
     const r = room.action(info.pid, p);
     scheduleBroadcast(room);
-    return r && r.placement !== undefined ? { placement: r.placement } : {};
+    return r && r.placement !== undefined ? { placement: r.placement, islands: r.islands } : {};
   }));
   socket.on('disconnect', () => { try { detach(socket); } catch (e) { console.error('[disconnect]', e); } });
 });

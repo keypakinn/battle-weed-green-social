@@ -7,9 +7,8 @@
     columns: {
       id: { type: 'id', required: true },
       name: { type: 'text', required: true, max: 16 },
-      size: { type: 'int', required: true, min: 2, max: 5, rule: true },
-      flavor: { type: 'text', max: 80 },
+      shape: { type: 'shape', required: true, max: 120, rule: true },
     },
-    secret: [], // ไม่มีคอลัมน์ลับ (R-4.1-05)
+    secret: [], // ไม่มีคอลัมน์ลับ (R-4.1-04)
   };
 });
