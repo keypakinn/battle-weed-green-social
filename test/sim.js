@@ -1,5 +1,5 @@
 'use strict';
-// จำลองกติกาตาม test scenario ใน spec v2.1 หัวข้อ 14 (T-xx) — รันด้วย npm test
+// จำลองกติกาตาม test scenario ใน spec v2.2 หัวข้อ 14 (T-xx) — รันด้วย npm test
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -473,6 +473,121 @@ test('R-7-70 Survival ชิ้นของคนที่ยอมแพ้ = �
   x.room.action(x.P[1], { type: 'resign' });
   round(x, { [x.P[0]]: [shot(12, 8)] });
   assert.strictEqual(pub(x, '*', 12, 8), 'miss');
+});
+
+// ---------- v2.2 ----------
+const aim = (x, pid, shots) => x.room.action(pid, { type: 'aim', turnNo: x.room.turnNo, shots });
+const kinds = (list, to) => list.filter(n => n.to === to).map(n => n.kind);
+test('T-45 turns เลือกช่องไว้แล้วหมดเวลา = ยิงเอง ได้ยิงต่อ autoStreak = 0 นับ hitsOnOthers [R-8-12, R-8-13]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  seatOf(x, a).autoStreak = 2;
+  aim(x, a, [shot(0, 0, b)]);
+  T += 15000; x.room.tick();
+  const sa = seatOf(x, a);
+  assert.strictEqual(pub(x, b, 0, 0), 'hit');
+  assert.strictEqual(sa.autoStreak, 0);
+  assert.strictEqual(sa.hitsOnOthers, 1);
+  assert.strictEqual(x.room.turnPid, a);                        // ยิงต่อ
+  assert.strictEqual(x.room.lastResolve[0].auto, false);
+  const n = notices(x);
+  assert.ok(kinds(n, a).includes('aim_fired') && kinds(n, a).includes('big_again'));
+  assert.ok(kinds(n, b).includes('again'));
+});
+test('T-46 turns ไม่ได้เลือกช่อง หมดเวลา = ยิงแทน autoStreak +1 ไม่ได้ยิงต่อ [R-8-02]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid;
+  aim(x, a, [shot(0, 0, x.P.find(p => p !== a))]); aim(x, a, []);   // เลือกแล้วยกเลิก
+  T += 15000; x.room.tick();
+  assert.strictEqual(seatOf(x, a).autoStreak, 1);
+  assert.notStrictEqual(x.room.turnPid, a);
+});
+test('T-47 rounds ได้ 2 นัด เลือกไว้ 1 = นัดนั้นยิงเอง อีกนัดสุ่ม ไม่นับยิงแทน [R-8-14]', () => {
+  const x = start(3, { mode: 'survival' });
+  const [a, b, c] = x.P;
+  seatOf(x, a).shotsAllowed = 2; seatOf(x, a).autoStreak = 2;
+  x.room._beginRound();
+  assert.strictEqual(x.room.deadline - T, 20000);
+  aim(x, a, [shot(5, 8)]);
+  round(x, {}, [a]);
+  T += 20000; x.room.tick();
+  const lr = x.room.lastResolve.filter(r => r.shooterPid === a);
+  assert.strictEqual(lr.length, 2);
+  assert.ok(lr.some(r => !r.auto && r.cells[0][0] === 5 && r.cells[0][1] === 8));
+  assert.ok(lr.some(r => r.auto));
+  assert.strictEqual(seatOf(x, a).autoStreak, 0);
+  assert.strictEqual(seatOf(x, a).aim, null);
+});
+test('T-48 rounds ไม่ได้เลือกเลย = ยิงแทนทั้งหมด autoStreak +1 [R-8-03]', () => {
+  const x = start(3, { mode: 'survival' });
+  const a = x.P[0];
+  round(x, {}, [a]);
+  T += 15000; x.room.tick();
+  assert.strictEqual(seatOf(x, a).autoStreak, 1);
+  assert.ok(x.room.lastResolve.filter(r => r.shooterPid === a).every(r => r.auto));
+});
+test('T-49 เลือกช่องผิดกติกา: ไม่ใช่ตา / ช่องที่ยิงแล้ว / เกินจำนวนนัด / ส่งแล้วเลือกไม่ได้ [R-8-12]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  throwsCode(() => aim(x, b, [shot(5, 5, a)]), 'NOT_YOUR_TURN');
+  throwsCode(() => aim(x, a, [shot(5, 5, b), shot(5, 6, b)]), 'SHOT_COUNT');
+  throwsCode(() => aim(x, a, [shot(5, 5, a)]), 'BAD_TARGET');
+  fire(x, a, [shot(5, 5, b)]);                                   // พลาด เปลี่ยนตา
+  throwsCode(() => aim(x, b, [shot(5, 5, b)]), 'BAD_TARGET');
+  fire(x, b, [shot(5, 5, a)]);
+  throwsCode(() => aim(x, a, [shot(5, 5, b)]), 'ALREADY_SHOT');
+  const y = start(3, { mode: 'survival' });
+  fire(y, y.P[0], [shot(5, 8)]);
+  throwsCode(() => aim(y, y.P[0], [shot(5, 9)]), 'NOT_YOUR_TURN');
+});
+test('T-50 ช่องที่เลือกไว้เห็นเฉพาะเจ้าของ และล้างเมื่อเปลี่ยนตา [R-8-12, R-4-01]', () => {
+  const x = start(2, { mode: 'classic' });
+  const a = x.room.turnPid, b = x.P.find(p => p !== a);
+  aim(x, a, [shot(5, 5, b)]);
+  assert.deepStrictEqual(x.room.getState(a).me.aim[0].row, 5);
+  const sb = x.room.getState(b);
+  assert.strictEqual(sb.me.aim, null);
+  assert.ok(!JSON.stringify(sb.players).includes('"aim"'));
+  fire(x, a, [shot(6, 6, b)]);
+  assert.strictEqual(seatOf(x, a).aim, null);
+});
+test('T-51 Survival ยิงโดนช่องที่มีแค่ของตัวเอง = ไม่ได้ยิงต่อ + แจ้งเตือนคนยิง [R-7-45]', () => {
+  const moved = LAYOUT.map(p => p.pieceId === 'pipe' ? { ...p, row: 12, col: 0 } : p);
+  const x = start(2, { mode: 'survival' }, 1, [null, moved]);
+  const a = x.room.turnPid;
+  const [r, c] = a === x.P[0] ? [0, 7] : [12, 0];
+  notices(x);
+  fire(x, a, [shot(r, c)]);
+  assert.notStrictEqual(x.room.turnPid, a);
+  const n = notices(x);
+  assert.ok(kinds(n, a).includes('own_hit'));
+  assert.ok(!n.some(z => z.kind === 'own_hit' && z.to !== a));
+});
+test('T-52 rounds รอบที่ได้ 2 นัด แจ้งเตือนตัวใหญ่คนได้ ข้อความเล็กคนอื่น [R-10-07]', () => {
+  const x = start(3, { mode: 'classic' });
+  const [a, b, c] = x.P;
+  notices(x);
+  round(x, { [a]: [shot(0, 0, b)] });
+  assert.strictEqual(seatOf(x, a).shotsAllowed, 2);
+  const n = notices(x);
+  assert.ok(kinds(n, a).includes('big_two'));
+  assert.ok(kinds(n, b).includes('two') && kinds(n, c).includes('two'));
+  assert.ok(!kinds(n, a).includes('two'));
+});
+test('T-53 หน้าจบเกมมีเหตุผลที่ตกรอบของแต่ละคน [R-9-07]', () => {
+  const x = start(3, { mode: 'classic' });
+  const [a, b, c] = x.P;
+  x.room.action(c, { type: 'resign' });
+  for (let i = 0; i < 3; i++) { round(x, {}, [b]); T += 15000; x.room.tick(); if (x.room.phase === 'GAME_OVER') break; }
+  assert.strictEqual(x.room.phase, 'GAME_OVER');
+  const er = x.room.getState(a).result.elimReasons;
+  assert.strictEqual(er[c], 'resign');
+  assert.strictEqual(er[b], 'auto_limit');
+  assert.strictEqual(er[a], undefined);
+});
+test('T-54 รหัสห้องเป็นตัวเลข 4 หลัก [R-5-01]', () => {
+  assert.strictEqual(CONFIG.ROOM_CODE_LEN, 4);
+  assert.ok(/^[0-9]+$/.test(CONFIG.ROOM_CODE_CHARS));
 });
 
 let fail = 0;

@@ -34,8 +34,8 @@ const sockRoom = new Map();        // socket.id -> { code, pid }
 
 function newCode() {
   for (;;) {
-    let c = '';
-    for (let i = 0; i < CONFIG.ROOM_CODE_LEN; i++) c += CONFIG.ROOM_CODE_CHARS[crypto.randomInt(CONFIG.ROOM_CODE_CHARS.length)];
+    let c = String(1 + crypto.randomInt(9));        // [แก้ v2.2] ตัวแรก 1–9
+    for (let i = 1; i < CONFIG.ROOM_CODE_LEN; i++) c += CONFIG.ROOM_CODE_CHARS[crypto.randomInt(CONFIG.ROOM_CODE_CHARS.length)];
     if (!rooms.has(c)) return c;
   }
 }
@@ -105,7 +105,7 @@ io.on('connection', socket => {
     return { code, pid, token };
   }));
   socket.on('join', (p, ack) => safe(ack, () => {
-    const code = String(obj(p).code || '').trim().toUpperCase().slice(0, 10);
+    const code = String(obj(p).code || '').replace(/\s/g, '').toUpperCase().slice(0, 10);
     const room = rooms.get(code);
     if (!room) throw new GameError('ROOM_NOT_FOUND', 'ไม่พบห้องนี้');   // R-5-04
     const { pid, token } = room.addPlayer(obj(p).name);

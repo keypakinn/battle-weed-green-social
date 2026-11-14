@@ -1,5 +1,5 @@
 'use strict';
-// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.1) — ไม่ import express/socket.io
+// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.2) — ไม่ import express/socket.io
 // รหัสกติกา R-x-yy อ้างถึงหัวข้อใน spec.md
 const crypto = require('crypto');
 
@@ -32,8 +32,8 @@ const CONFIG = Object.freeze({
   ANIM_EFFECT_MS: 1000,
   SUNK_REVEAL_MS: 2000,
   IMAGE_MARGIN: 0.12,
-  ROOM_CODE_LEN: 5,
-  ROOM_CODE_CHARS: 'ABCDEFGHJKMNPQRSTUVWXYZ23456789',
+  ROOM_CODE_LEN: 4,                 // [แก้ v2.2] รหัสห้องตัวเลข 4 หลัก ตัวแรกไม่ใช่ 0
+  ROOM_CODE_CHARS: '0123456789',
   NAME_MAX: 16,
   MIN_AGE: 20,
   PLAYER_COLORS: ['#F2C230', '#FF5FA2', '#F5F5F5', '#E53935', '#A1673A', '#FFB74D', '#3F51B5'],
@@ -174,7 +174,7 @@ class Room {
   _resetSeat(s) {
     Object.assign(s, {
       ready: false, alive: true, wantsRematch: false, placement: null, pieces: [], islands: [],
-      autoStreak: 0, shotsAllowed: 1, doubleBonus: false, skipNext: false, hitsOnOthers: 0,
+      autoStreak: 0, shotsAllowed: 1, doubleBonus: false, skipNext: false, hitsOnOthers: 0, aim: null,
       pending: null, elimAt: null, elimReason: null, shots: 0, hits: 0,
     });
   }
@@ -381,6 +381,7 @@ class Room {
       case 'suggest_placement': return this._suggest(s);
       case 'submit_placement': return this._submit(s, msg.placement, msg.islands);
       case 'fire': return this._fire(s, msg);
+      case 'aim': return this._aim(s, msg);
       case 'resign': return this._resign(s);
       case 'rematch': return this._rematch(s, msg.want);
       case 'back_to_lobby': return this._backToLobby(s);
@@ -499,7 +500,7 @@ class Room {
     shots.forEach((sh, i) => sh.cells.forEach(k => {
       const id = sh.board + '|' + k; if (!byCell.has(id)) byCell.set(id, []); byCell.get(id).push(i);
     }));
-    const per = shots.map(() => ({ bonusHit: false, islandOther: false, trap: false, cells: [] }));
+    const per = shots.map(() => ({ bonusHit: false, ownHit: false, islandOther: false, trap: false, cells: [] }));
     const hitPieces = []; // {pid, idx}
     const touchedIslands = [];
     for (const [id, idxs] of byCell) {
@@ -523,6 +524,7 @@ class Room {
         per[i].cells.push([...this._rc(k), pub]);
         if (pub === 'trap') per[i].trap = true;
         if (occ.pieces.some(x => x.pid !== sh.shooter)) per[i].bonusHit = true;            // R-7-40
+        if (occ.pieces.some(x => x.pid === sh.shooter)) per[i].ownHit = true;              // R-7-45
         if (occ.islands.some(x => x.pid !== sh.shooter)) per[i].islandOther = true;        // R-7-51
       }
     }
@@ -602,7 +604,8 @@ class Room {
     let rank = 0, last = null;
     sorted.forEach((p, i) => { const kv = key(p); if (kv !== last) { rank = i + 1; last = kv; } ranks.push({ pid: p.pid, rank }); });
     this.result = { winnerPid: winnerPid || null, reason, ranking: ranks,
-      hitsOnOthers: Object.fromEntries(ps.map(p => [p.pid, p.hitsOnOthers])) };
+      hitsOnOthers: Object.fromEntries(ps.map(p => [p.pid, p.hitsOnOthers])),
+      elimReasons: Object.fromEntries(ps.filter(p => p.elimReason).map(p => [p.pid, p.elimReason])) }; // R-9-07 [ใหม่ v2.2]
     const al2 = this.active();
     const loser = winnerPid && al2.length === 2 ? al2.find(p => p.pid !== winnerPid) : null;
     this.prev = { loserPid: loser ? loser.pid : null, pair: al2.map(p => p.pid).sort().join(',') };
@@ -612,7 +615,7 @@ class Room {
   }
 
   // ---------- การยิง ----------
-  _parseShots(s, msg) {
+  _parseShots(s, msg, startIdx = 0) {
     if (!Array.isArray(msg.shots) || !msg.shots.length) throw err('BAD_REQUEST');
     const B = this.boardSize; const out = []; const used = new Set();
     msg.shots.forEach((x, i) => {
@@ -626,9 +629,10 @@ class Room {
       }
       const bd = this.boards.get(board);
       const cells = [this._key(x.row, x.col)];
-      const wantDouble = i === 0 && s.doubleBonus;
+      const first = i + startIdx === 0;
+      const wantDouble = first && s.doubleBonus;
       if (x.double != null || wantDouble) {                                                        // R-7-53
-        if (!s.doubleBonus || i !== 0) throw err('DOUBLE_INVALID');
+        if (!s.doubleBonus || !first) throw err('DOUBLE_INVALID');
         if (x.double == null) { if (this._anyDouble(board)) throw err('DOUBLE_INVALID'); }
         else {
           if (x.double !== 'H' && x.double !== 'V') throw err('DOUBLE_INVALID');
@@ -663,16 +667,54 @@ class Room {
       if (!Array.isArray(msg.shots) || msg.shots.length !== 1) throw err('SHOT_COUNT');
       const shots = this._parseShots(s, msg);
       s.autoStreak = 0;                                                                           // R-7-71
+      s.aim = null;
       this._turnShot(s, shots[0]);
     } else {
       if (!this.roundShooters.has(s.pid)) throw err('NOT_YOUR_TURN');
       if (s.pending) throw err('ALREADY_SUBMITTED');
       if (!Array.isArray(msg.shots) || msg.shots.length !== s.shotsAllowed) throw err('SHOT_COUNT'); // R-7-12
       s.pending = this._parseShots(s, msg);
-      s.autoStreak = 0;
+      s.autoStreak = 0; s.aim = null;
       if ([...this.roundShooters].every(pid => { const p = this.seat(pid); return !p || !p.alive || p.pending; })) this._resolveRound();
     }
     return {};
+  }
+  // [ใหม่ v2.2] R-8-12 ช่องที่เลือกไว้ (ยังไม่กดยิง) เก็บที่ server แบบส่วนตัว
+  _canShootNow(s) {
+    if (this.phase !== 'BATTLE' || !s.alive) return false;
+    if (this.turnStyle === 'turns') return this.turnPid === s.pid;
+    return !!this.roundShooters && this.roundShooters.has(s.pid) && !s.pending;
+  }
+  _aim(s, msg) {
+    if (this.phase !== 'BATTLE') throw err('BAD_PHASE');
+    if (msg.turnNo !== this.turnNo) throw err('STALE_TURN');
+    if (!this._canShootNow(s)) throw err('NOT_YOUR_TURN');
+    if (!Array.isArray(msg.shots)) throw err('BAD_REQUEST');
+    const max = this.turnStyle === 'turns' ? 1 : s.shotsAllowed;
+    if (msg.shots.length > max) throw err('SHOT_COUNT');
+    if (!msg.shots.length) { s.aim = null; return {}; }
+    this._parseShots(s, msg);                       // ตรวจเหมือนการยิงจริง
+    s.aim = msg.shots.map(x => ({ board: x.board, row: x.row, col: x.col, double: x.double }));
+    return {};
+  }
+  // R-8-13 หมดเวลา: ช่องที่เลือกไว้ที่ยังยิงได้ = ยิงเอง (auto: false)
+  _aimShots(s, max) {
+    const out = []; const used = new Set();
+    for (const x of (s.aim || []).slice(0, max)) {
+      try {
+        const spec = { ...x }; if (out.length !== 0) delete spec.double;
+        const sh = this._parseShots(s, { shots: [spec] }, out.length)[0];
+        if (sh.cells.some(k => used.has(sh.board + '|' + k))) continue;
+        sh.cells.forEach(k => used.add(sh.board + '|' + k));
+        out.push(sh);
+      } catch (e) { /* ช่องนั้นใช้ไม่ได้แล้ว ข้าม */ }
+    }
+    return out;
+  }
+  _autoFill(s, own, count) { // สุ่มนัดที่ขาด ไม่ซ้ำกับนัดที่เลือกเอง
+    const taken = new Set(); own.forEach(sh => sh.cells.forEach(k => taken.add(sh.board + '|' + k)));
+    const extra = this._autoShots(s, count, taken, own.length);
+    return extra;
   }
   _consumeDouble(s, shot) { if (s.doubleBonus) s.doubleBonus = false; return shot; }
 
@@ -688,14 +730,21 @@ class Room {
       if (this.settings.bonusOnHit && r.bonusHit) again = true;
       if (r.islandOther) again = true;
     }
+    if (!shot.auto && !r.trap && !again && r.ownHit && this.settings.bonusOnHit)                    // R-7-45 [ใหม่ v2.2]
+      this._notice(s.pid, 'own_hit', 'โดนของคุณเอง ไม่ได้ยิงต่อ');
     if (shot.auto && s.autoStreak >= this.C.AUTO_SHOT_LIMIT) {                                     // R-8-04
       this._eliminate([s], 'auto_limit');
       if (this._checkEnd([s], true)) return;
     }
-    this.turnNo++;
-    if (again && s.alive) { this.deadline = this.now() + this.C.SHOT_TIME * 1000; return; }
+    this.turnNo++; s.aim = null;
+    if (again && s.alive) {                                                                        // R-10-07 [ใหม่ v2.2]
+      this._notice(s.pid, 'big_again', 'โดน! ยิงต่อได้อีกนัด');
+      this._others(s.pid, 'again', `${s.name} ได้ยิงต่อ`);
+      this.deadline = this.now() + this.C.SHOT_TIME * 1000; return;
+    }
     this._nextTurn(s.pid);
   }
+  _others(pid, kind, text) { for (const p of this.active()) if (p.pid !== pid) this._notice(p.pid, kind, text, { pid }); }
   _nextTurn(fromPid) {
     const al = this.alive(); if (al.length < 2) return;
     if (al.every(p => p.skipNext)) al.forEach(p => { p.skipNext = false; });                        // R-7-63
@@ -720,13 +769,15 @@ class Room {
       p.pending = null;
       if (p.skipNext) { p.skipNext = false; p.skippedRound = this.roundNo; this._notice('all', 'skip', `${p.name} ถูกข้ามรอบนี้`, { pid: p.pid }); continue; }
       this.roundShooters.add(p.pid);
+      p.aim = null;
+      if (p.shotsAllowed > 1) { this._notice(p.pid, 'big_two', 'รอบนี้ยิงได้ 2 นัด!'); this._others(p.pid, 'two', `${p.name} ได้ 2 นัดรอบนี้`); } // R-10-07
     }
     const two = [...this.roundShooters].some(pid => this.seat(pid).shotsAllowed > 1);
     this.deadline = this.now() + (two ? this.C.ROUND_TIME_DOUBLE : this.C.SHOT_TIME) * 1000;       // R-8-03
   }
-  _autoShots(s, count) { // R-8-02 / R-8-03 สุ่มช่องที่ยังไม่ถูกยิง
-    const out = []; const used = new Set();
-    for (let i = 0; i < count; i++) {
+  _autoShots(s, count, taken, startIdx = 0) { // R-8-02 / R-8-03 สุ่มช่องที่ยังไม่ถูกยิง
+    const out = []; const used = new Set(taken || []);
+    for (let i = startIdx; i < startIdx + count; i++) {
       let board = '*';
       if (this.settings.mode === 'classic') {
         const opts = this.alive().filter(p => p.pid !== s.pid && this._freeCells(p.pid, used).length);
@@ -758,7 +809,16 @@ class Room {
     const all = [];
     const autoPids = new Set();
     for (const p of shooters) {
-      if (!p.pending) { p.pending = this._autoShots(p, p.shotsAllowed); p.autoStreak++; autoPids.add(p.pid); }
+      if (!p.pending) { // R-8-03, R-8-13, R-8-14
+        const own = this._aimShots(p, p.shotsAllowed);
+        if (!own.length) { p.pending = this._autoShots(p, p.shotsAllowed); p.autoStreak++; autoPids.add(p.pid); }
+        else {
+          p.pending = own.length < p.shotsAllowed ? [...own, ...this._autoFill(p, own, p.shotsAllowed - own.length)] : own;
+          p.autoStreak = 0;
+          this._notice(p.pid, 'aim_fired', 'หมดเวลา — ยิงช่องที่คุณเลือกไว้');
+        }
+        p.aim = null;
+      }
       if (p.doubleBonus && p.pending.length) p.doubleBonus = false;
       all.push(...p.pending);
     }
@@ -771,6 +831,8 @@ class Room {
         if ((this.settings.bonusOnHit && per[i].bonusHit) || per[i].islandOther) two = true;
       });
       p.shotsAllowed = two ? Math.min(2, this.C.MAX_SHOTS_PER_ROUND) : 1;
+      if (!two && this.settings.bonusOnHit && all.some((sh, i) => sh.shooter === p.pid && !sh.auto && per[i].ownHit && !per[i].trap))
+        this._notice(p.pid, 'own_hit', 'โดนของคุณเอง ไม่ได้ 2 นัดรอบหน้า');                     // R-7-45
       p.pending = null;
     }
     this._eliminate(elim, 'sunk');
@@ -845,9 +907,9 @@ class Room {
     } else if (this.phase === 'BATTLE' && t >= this.deadline) {
       if (this.turnStyle === 'turns') { // R-8-02
         const s = this.seat(this.turnPid);
-        const shot = this._autoShots(s, 1)[0];
-        s.autoStreak++;
-        this._turnShot(s, shot);
+        const own = this._aimShots(s, 1);                                                           // R-8-13
+        if (own.length) { s.autoStreak = 0; s.aim = null; this._notice(s.pid, 'aim_fired', 'หมดเวลา — ยิงช่องที่คุณเลือกไว้'); this._turnShot(s, own[0]); }
+        else { const shot = this._autoShots(s, 1)[0]; s.autoStreak++; s.aim = null; this._turnShot(s, shot); }
       } else this._resolveRound(); // R-8-03
       changed = true;
     }
@@ -899,6 +961,7 @@ class Room {
           const bd = this.boards.get(this.settings.mode === 'classic' ? me.pid : '*'); return bd && bd.shot.has(k);
         }).map(k => [...this._rc(k), pc.id])),
         pending: me.pending ? me.pending.map(sh => ({ board: sh.board, cells: sh.cells.map(k => this._rc(k)) })) : null,
+        aim: me.aim ? me.aim.map(x => ({ ...x })) : null,
       } : null,
     };
   }

@@ -1,4 +1,4 @@
-/* Battle Weed: Green Social v2 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
+/* Battle Weed: Green Social v2.2 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
 (function () {
   'use strict';
   const $ = s => document.querySelector(s);
@@ -22,14 +22,14 @@
     session: ss.get('bw_session') || store.get('bw_session'),
     cat: new Map(), fit: {}, ver: '0',
     st: null, offset: 0, recvAt: 0,
-    name: store.get('bw_name') || '', code: (qs.get('room') || '').toUpperCase().slice(0, 10),
+    name: store.get('bw_name') || '', code: (qs.get('room') || '').replace(/\D/g, '').slice(0, 4),
     // วาง
-    draft: {}, sel: null, rot: 0, placingGame: 0, islMode: false, isl: new Set(),
+    draft: {}, sel: null, pick: null, drag: null, placingGame: 0, islMode: false, isl: new Set(),
     // ยิง
     aim: [], dbl: 'H', tab: null, zoom: 1, sumOpen: false,
     // แอนิเมชัน
     anim: new Map(), reveal: new Map(), lastResolveKey: null, seen: false,
-    modal: null, replaced: false, lost: null, installEvt: null, notes: [],
+    modal: null, replaced: false, lost: null, installEvt: null, notes: [], turnKey: null, restoreAim: true,
   };
   let reqSeq = 0;
   const reqId = () => `r${Date.now().toString(36)}${(reqSeq++).toString(36)}`;
@@ -58,7 +58,7 @@
   // ---------- socket ----------
   const socket = io({ transports: ['websocket', 'polling'] });
   const net = $('#net');
-  socket.on('connect', () => { net.hidden = true; if (S.session && !S.replaced) resume(); });
+  socket.on('connect', () => { net.hidden = true; S.restoreAim = true; if (S.session && !S.replaced) resume(); });
   socket.on('disconnect', reason => { if (reason !== 'io server disconnect') net.hidden = false; });
   socket.on('replaced', () => { S.replaced = true; render(); });
   socket.on('state', st => {
@@ -66,12 +66,15 @@
     S.st = st; S.recvAt = Date.now(); S.offset = st.serverNow - Date.now();
     if (st.phase === 'PLACING' && S.placingGame !== st.gameNo) resetDraft(st.gameNo);
     if (st.phase !== 'BATTLE' || !prev || prev.turnNo !== st.turnNo) S.aim = [];
+    if (S.restoreAim && st.phase === 'BATTLE' && st.me && st.me.aim) S.aim = st.me.aim.map(a => ({ board: a.board || '*', row: a.row, col: a.col })); // R-8-12 กลับเข้าแล้วช่องที่เลือกยังอยู่
+    S.restoreAim = false;
     if (st.phase === 'BATTLE' && !S.tab) S.tab = null;
     onResolve(st, prev);
+    turnAlert(st, prev);
     S.seen = true;
     render();
   });
-  socket.on('notice', list => { for (const n of list) note(n.text, n.kind); });
+  socket.on('notice', list => { for (const n of list) { if (/^big_/.test(n.kind)) bigAlert(n.text); else note(n.text, n.kind); } });
   function resume() {
     socket.emit('resume', { code: S.session.code, token: S.session.token }, r => {
       if (!r || !r.ok) { S.lost = r && r.error ? r.error : 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่'; dropSession(); }
@@ -82,6 +85,7 @@
     return new Promise(res => socket.emit(ev, payload, r => {
       if (!r || !r.ok) {
         const quiet = ['STALE_TURN', 'BAD_PHASE', 'ALREADY_PLACED', 'OUT_OF_BOUNDS', 'BAD_REQUEST', 'NOT_HOST', 'SHOT_COUNT', 'ALREADY_SUBMITTED'];
+        if (payload && payload.type === 'aim') quiet.push('NOT_YOUR_TURN', 'DOUBLE_INVALID', 'ALREADY_SHOT', 'BAD_TARGET');
         if (r && !quiet.includes(r.code)) toast(r.error || 'ทำไม่สำเร็จ');
         if (r && (r.code === 'ROOM_NOT_FOUND' || r.code === 'BAD_TOKEN')) dropSession();
       }
@@ -106,8 +110,24 @@
     while (box.children.length > 4) box.firstChild.remove();
     setTimeout(() => d.classList.add('out'), 3200); setTimeout(() => d.remove(), 3700);
   }
+  // R-10-07 ข้อความตัวใหญ่กลางจอ (ตาคุณ / ยิงต่อ / 2 นัด) ข้อความที่มาติดกันรวมเป็นหลายบรรทัด
+  function bigAlert(text) {
+    const el = $('#bigalert'); if (!el || !text) return;
+    const t = Date.now();
+    if (el.classList.contains('show') && t - bigAlert.at < 500) el.insertAdjacentHTML('beforeend', `<div>${esc(text)}</div>`);
+    else { el.innerHTML = `<div>${esc(text)}</div>`; el.classList.remove('show'); void el.offsetWidth; el.classList.add('show'); bigAlert.at = t; }
+    clearTimeout(bigAlert.tm); bigAlert.tm = setTimeout(() => el.classList.remove('show'), 1700);
+  }
+  function turnAlert(st, prev) {
+    const m = st.players.find(p => p.pid === st.you);
+    const mine = st.phase === 'BATTLE' && m && m.alive && (st.turnStyle === 'turns' ? st.turnPid === m.pid : m.shooting && !m.submitted);
+    const key = mine ? `${st.gameNo}:${st.turnStyle === 'turns' ? 'T' : st.roundNo}` : null;
+    const cont = st.turnStyle === 'turns' && prev && prev.phase === 'BATTLE' && prev.turnPid === st.you; // ยิงต่อ ใช้ข้อความ "โดน! ยิงต่อได้อีกนัด" แทน
+    if (key && key !== S.turnKey && !cont && S.seen) bigAlert('ตาคุณ!');
+    if (st.turnStyle === 'turns') S.turnKey = mine ? key : null; else if (key) S.turnKey = key;
+  }
   const STATE_SVG = {
-    miss: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="15" r="5" fill="#9AA79E" opacity=".55"/><circle cx="15" cy="10" r="4" fill="#9AA79E" opacity=".45"/><circle cx="18" cy="5" r="2.5" fill="#9AA79E" opacity=".35"/></svg>',
+    miss: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.4" fill="#D5DED8" opacity=".85"/></svg>',
     hit: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.2 5.4 5.6-2-2.4 5.3L23 12l-5.6 1.4 2.4 5.3-5.6-2L12 22l-2.2-5.3-5.6 2 2.4-5.3L1 12l5.6-1.3-2.4-5.3 5.6 2z" fill="#1A0E08" stroke="#F07A2A" stroke-width="1.6"/></svg>',
     island: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21c0-5 .5-8 2-11" stroke="#7A5230" stroke-width="2" fill="none"/><path d="M14 10c-2-3-6-3-8-1 3-1 5 0 8 1zm0 0c1-3 5-5 8-3-3 0-5 1-8 3zm0 0c3-1 6 1 7 4-2-2-4-3-7-4z" fill="#2E9E4F"/><ellipse cx="12" cy="21.5" rx="7" ry="1.6" fill="#E9D79B"/></svg>',
     trap: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18M5 19l2-9 3 5 2-8 2 8 3-5 2 9" fill="none" stroke="#C77DFF" stroke-width="2.2" stroke-linejoin="round"/><circle cx="12" cy="5" r="2" fill="#C77DFF"/></svg>',
@@ -150,24 +170,24 @@
     }
   }
 
-  // ---------- วาง ----------
+  // ---------- วาง (v2.2 R-7-08: แตะช่องว่าง = วาง · แตะชิ้น = เลือก แล้วย้าย/หมุน/เอาออก · กดค้างแล้วลาก) ----------
   function resetDraft(gameNo) {
-    S.placingGame = gameNo; S.draft = {}; S.rot = 0; S.islMode = false; S.isl = new Set();
-    S.sel = S.st.fleet[0] || null; S.aim = []; S.tab = null; S.anim.clear(); S.reveal.clear();
+    S.placingGame = gameNo; S.draft = {}; S.islMode = false; S.isl = new Set(); S.drag = null;
+    S.sel = null; S.pick = S.st.fleet[0] || null; S.aim = []; S.tab = null; S.anim.clear(); S.reveal.clear();
   }
   function draftCells(except) {
     const m = new Map();
     for (const [id, v] of Object.entries(S.draft)) if (id !== except) for (const [r, c] of absCells({ pieceId: id, ...v })) m.set(kk(r, c), id);
     return m;
   }
+  // คืน null ถ้าวางได้ หรือ {why, with}
   function fits(id, row, col, rot) {
     const taken = draftCells(id);
-    for (const [r, c] of absCells({ pieceId: id, row, col, rot })) {
-      if (r < 0 || c < 0 || r >= B() || c >= B()) return 'BOUNDS';
-      if (taken.has(kk(r, c))) return 'OVERLAP';
-    }
+    for (const [r, c] of absCells({ pieceId: id, row, col, rot })) if (r < 0 || c < 0 || r >= B() || c >= B()) return { why: 'BOUNDS' };
+    for (const [r, c] of absCells({ pieceId: id, row, col, rot })) if (taken.has(kk(r, c))) return { why: 'OVERLAP', with: taken.get(kk(r, c)) };
     return null;
   }
+  const whyText = f => f.why === 'BOUNDS' ? 'ไม่สามารถวางออกนอกกระดานได้' : `ไม่สามารถวางทับ${piece(f.with).name}ได้`;
   const nextUnplaced = () => S.st.fleet.find(id => !S.draft[id]) || null;
   function placeAt(r, c) {
     if (S.islMode) { // R-7-05 วาดเกาะ
@@ -178,15 +198,83 @@
       return render();
     }
     const here = draftCells().get(kk(r, c));
-    if (here) { S.sel = here; S.rot = S.draft[here].rot; delete S.draft[here]; return render(); }
-    if (!S.sel) S.sel = nextUnplaced();
-    if (!S.sel) return toast('วางครบแล้ว แตะชิ้นบนกระดานเพื่อย้าย');
-    const bad = fits(S.sel, r, c, S.rot);
-    if (bad) return toast(bad === 'BOUNDS' ? 'ล้นออกนอกกระดาน ลองหมุนหรือขยับ' : 'ทับกับชิ้นของคุณเอง');
-    S.draft[S.sel] = { row: r, col: c, rot: S.rot };
-    S.sel = nextUnplaced(); S.rot = 0;
+    if (here) { S.sel = S.sel === here ? null : here; return render(); }       // แตะชิ้น = เลือก / แตะซ้ำ = เลิกเลือก
+    if (S.sel) {                                                               // ย้ายชิ้นที่เลือกไปช่องที่แตะ
+      const v = S.draft[S.sel]; const bad = fits(S.sel, r, c, v.rot);
+      if (bad) return toast(whyText(bad));
+      S.draft[S.sel] = { ...v, row: r, col: c }; return render();
+    }
+    const id = S.pick && !S.draft[S.pick] ? S.pick : nextUnplaced();
+    if (!id) return toast('วางครบแล้ว แตะชิ้นบนกระดานเพื่อย้าย หมุน หรือเอาออก');
+    const bad = fits(id, r, c, 0);
+    if (bad) return toast(whyText(bad));
+    S.draft[id] = { row: r, col: c, rot: 0 };
+    S.pick = nextUnplaced();
     render();
   }
+  function rotateSel() {
+    const id = S.sel; if (!id) return;
+    const v = S.draft[id]; const rot = (v.rot + 1) % 4;
+    const cells = rotateCells(piece(id).cells, rot);
+    const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
+    const row = Math.max(0, Math.min(v.row, B() - h)), col = Math.max(0, Math.min(v.col, B() - w)); // หมุนแล้วล้น = ขยับเข้ามาในกระดาน
+    const bad = fits(id, row, col, rot);
+    if (bad) return toast(whyText(bad));
+    S.draft[id] = { row, col, rot }; render();
+  }
+  function removeSel() { if (!S.sel) return; delete S.draft[S.sel]; S.pick = S.sel; S.sel = null; render(); }
+
+  // กดค้างที่ชิ้นแล้วลาก (ไม่ render ระหว่างลาก ขยับแค่เงา)
+  const LONG_MS = 220;
+  function dragStart(x, y, target) {
+    if (!S.st || S.st.phase !== 'PLACING' || S.islMode) return;
+    const cell = target && target.closest && target.closest('.board.placing .cell[data-r]'); if (!cell) return;
+    const r = +cell.dataset.r, c = +cell.dataset.c; const id = draftCells().get(kk(r, c)); if (!id) return;
+    const v = S.draft[id];
+    S.drag = { id, dr: r - v.row, dc: c - v.col, x0: x, y0: y, active: false, pos: null, bad: null };
+    S.drag.timer = setTimeout(() => dragActivate(), LONG_MS);
+  }
+  function dragActivate() {
+    const d = S.drag; if (!d) return;
+    const board = document.querySelector('.board.placing'); if (!board) { S.drag = null; return; }
+    d.active = true; S.sel = d.id; d.cs = parseFloat(board.style.getPropertyValue('--cs'));
+    const layer = board.querySelector('.layer');
+    const orig = layer.querySelector(`.pimg[data-pid="${CSS.escape(d.id)}"]`); if (orig) orig.classList.add('dragging');
+    layer.querySelectorAll(`.oline[data-pid="${CSS.escape(d.id)}"]`).forEach(e => { e.style.display = 'none'; });
+    d.ghost = document.createElement('div'); d.ghost.className = 'dghost'; layer.appendChild(d.ghost);
+    const v = S.draft[d.id]; dragDraw(v.row, v.col);
+    if (navigator.vibrate) try { navigator.vibrate(15); } catch (e) { /* */ }
+  }
+  function dragDraw(row, col) {
+    const d = S.drag; const v = S.draft[d.id];
+    d.pos = { row, col }; d.bad = fits(d.id, row, col, v.rot);
+    const p = { pieceId: d.id, row, col, rot: v.rot, cls: 'ghostimg' };
+    d.ghost.innerHTML = pieceImg(p, d.cs) + outlineHTML({ cells: absCells(p), color: d.bad ? '#FF4B3A' : '#F2C230', w: 3 }, d.cs);
+    d.ghost.classList.toggle('bad', !!d.bad);
+  }
+  function dragMove(x, y) {
+    const d = S.drag; if (!d) return false;
+    if (!d.active) { if (Math.hypot(x - d.x0, y - d.y0) > 8) { clearTimeout(d.timer); S.drag = null; } return false; }
+    const el = document.elementFromPoint(x, y); const cell = el && el.closest && el.closest('.board.placing .cell[data-r]');
+    if (cell) { const row = +cell.dataset.r - d.dr, col = +cell.dataset.c - d.dc; if (!d.pos || d.pos.row !== row || d.pos.col !== col) dragDraw(row, col); }
+    return true;
+  }
+  function dragEnd() {
+    const d = S.drag; if (!d) return;
+    clearTimeout(d.timer); S.drag = null;
+    if (!d.active) return;
+    S.dragEndAt = Date.now();
+    if (d.pos && !d.bad) S.draft[d.id] = { ...S.draft[d.id], row: d.pos.row, col: d.pos.col };
+    else if (d.bad) toast(whyText(d.bad));                                    // ปล่อยตรงที่วางไม่ได้ = กลับที่เดิม
+    render();
+  }
+  document.addEventListener('touchstart', e => { if (e.touches.length === 1) dragStart(e.touches[0].clientX, e.touches[0].clientY, e.target); else if (S.drag) { clearTimeout(S.drag.timer); S.drag = null; render(); } }, { passive: true });
+  document.addEventListener('touchend', () => dragEnd(), { passive: true });
+  document.addEventListener('touchcancel', () => dragEnd(), { passive: true });
+  document.addEventListener('mousedown', e => { if (e.button === 0) dragStart(e.clientX, e.clientY, e.target); });
+  document.addEventListener('mousemove', e => { if (S.drag) dragMove(e.clientX, e.clientY); });
+  document.addEventListener('mouseup', () => dragEnd());
+  document.addEventListener('contextmenu', e => { if (e.target.closest && e.target.closest('.board.placing')) e.preventDefault(); });
   function islGroupsOk() {
     if (S.isl.size !== S.st.config.ISLAND_CELLS) return false;
     const seen = new Set();
@@ -207,7 +295,7 @@
   // layers: { board, cells: Map(k->state), clickable(r,c,state)->bool, marks: Map(k->cls), pieces:[{pieceId,row,col,rot,cls}], outlines:[{cells,color,pieceId,owner}], islands:Set(k), traps:Set(k) }
   function boardHTML(o) {
     const n = B(); const cs = cellSize(n + 1);
-    let h = `<div class="bwrap" data-zoomable="1"><div class="board" data-board="${esc(o.board)}" style="--n:${n};--cs:${cs}px">`;
+    let h = `<div class="bwrap" data-zoomable="1"><div class="board${o.placing ? ' placing' : ''}" data-board="${esc(o.board)}" style="--n:${n};--cs:${cs}px">`;
     h += `<div class="lab corner"></div>`;
     for (let c = 0; c < n; c++) h += `<div class="lab top">${c + 1}</div>`;
     const t = Date.now();
@@ -223,7 +311,7 @@
         else if (a && t < a.end) cls.push('burn');
         if (st && o.sunkCells && o.sunkCells.has(k) && (st === 'hit' || st === 'island_hit')) cls.push('s-sunk', st === 'island_hit' ? 's-island' : 'x');
         else if (st) { cls.push('s-' + st); inner = STATE_SVG[st] || ''; }
-        else if (!inner) cls.push('s-unshot');
+        else if (!inner) cls.push(o.ownCells && o.ownCells.has(k) ? 'own' : 's-unshot'); // v2.2 ช่องใต้ชิ้นของเราไม่มีลายใบ (เห็นเฉพาะเจ้าของ)
         if (o.islands && o.islands.has(k) && !st) cls.push('myisl');
         if (o.traps && o.traps.has(k) && !st) { cls.push('s-trap', 'reveal'); inner = STATE_SVG.trap; }
         if (o.marks && o.marks.get(k)) cls.push(o.marks.get(k));
@@ -248,7 +336,7 @@
     const W = (odd ? rows : cols) * cs, H = (odd ? cols : rows) * cs;
     const inner = f ? `<img src="${artURL(p.pieceId)}" alt="" style="left:${f.x * cs}px;top:${f.y * cs}px;width:${f.w * cs}px;height:${f.h * cs}px" onerror="this.remove()">`
       : `<span class="pname">${esc(pc.name)}</span>`;
-    return `<div class="pimg ${p.cls || ''}" style="left:${p.col * cs}px;top:${p.row * cs}px;width:${W}px;height:${H}px">
+    return `<div class="pimg ${p.cls || ''}" data-pid="${esc(p.pieceId)}" style="left:${p.col * cs}px;top:${p.row * cs}px;width:${W}px;height:${H}px">
       <div class="prot" style="width:${cols * cs}px;height:${rows * cs}px;left:${(W - cols * cs) / 2}px;top:${(H - rows * cs) / 2}px;transform:rotate(${p.rot * 90}deg)">${inner}</div></div>`;
   }
   function outlineHTML(ol, cs) { // R-10-03 เส้นขอบสีเจ้าของ + ภาพย่อ
@@ -258,9 +346,18 @@
       const sides = [];
       if (!set.has(kk(r - 1, c))) sides.push('border-top'); if (!set.has(kk(r + 1, c))) sides.push('border-bottom');
       if (!set.has(kk(r, c - 1))) sides.push('border-left'); if (!set.has(kk(r, c + 1))) sides.push('border-right');
-      h += `<div class="oline" style="left:${c * cs}px;top:${r * cs}px;width:${cs}px;height:${cs}px;${sides.map(s => `${s}:3px solid ${ol.color}`).join(';')}"></div>`;
+      h += `<div class="oline ${ol.cls || ''}" data-pid="${esc(ol.pieceId || '')}" style="left:${c * cs}px;top:${r * cs}px;width:${cs}px;height:${cs}px;${sides.map(s => `${s}:${ol.w || 3}px solid ${ol.color}`).join(';')}"></div>`;
     }
     return h;
+  }
+  // v2.2 R-10-08 ชิ้นของเราที่ยังไม่ดับ: ภาพเงาจาง + กรอบจางสีประจำตัว + ช่องไม่มีลายใบ (เห็นเฉพาะเจ้าของ)
+  function ownLayers(m, placement, selId) {
+    const sunk = new Set((m.sunk || []).map(s => s.pieceId));
+    const live = (placement || []).filter(p => !sunk.has(p.pieceId));
+    const ownCells = new Set();
+    const outlines = live.map(p => { const cells = absCells(p); cells.forEach(([r, c]) => ownCells.add(kk(r, c)));
+      return p.pieceId === selId ? { cells, color: '#FFFFFF', w: 3, pieceId: p.pieceId, cls: 'selol' } : { cells, color: m.color, w: 2, pieceId: p.pieceId, cls: 'faint' }; });
+    return { pieces: live.map(p => ({ ...p, cls: 'mine' + (p.pieceId === selId ? ' selp' : '') })), outlines, ownCells };
   }
   function sunkLayers(owners) { // ชิ้นที่ดับ: ภาพเต็มชัดค้างไว้ + กรอบสีเจ้าของ ไม่มีรอยไหม้ในช่องของชิ้น
     const pieces = [], outlines = [], cells = new Set(); const t = Date.now();
@@ -276,6 +373,7 @@
 
   // ---------- render ----------
   function render() {
+    if (S.drag && S.drag.active) return; // กำลังลากชิ้น — render หลังปล่อย
     const scroll = [...document.querySelectorAll('.bwrap')].map(el => [el.scrollLeft, el.scrollTop]);
     const focusId = document.activeElement && document.activeElement.id;
     let html;
@@ -316,10 +414,10 @@
       <section class="panel">
         <label for="in-name">ชื่อของคุณ</label>
         <input id="in-name" maxlength="16" autocomplete="nickname" value="${esc(S.name)}" placeholder="เช่น เอ">
-        ${S.code ? `<label for="in-code">รหัสห้อง</label><input id="in-code" maxlength="10" autocapitalize="characters" value="${esc(S.code)}">
+        ${S.code ? `<label for="in-code">รหัสห้อง</label><input id="in-code" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${esc(S.code)}">
           <button class="btn" data-act="join">เข้าห้อง ${esc(S.code)}</button><button class="btn ghost" data-act="create">สร้างห้องใหม่แทน</button>`
         : `<button class="btn" data-act="create">สร้างห้อง</button>
-          <label for="in-code">หรือใส่รหัสห้องของเพื่อน</label><input id="in-code" maxlength="10" autocapitalize="characters" value="" placeholder="เช่น K7MPQ">
+          <label for="in-code">หรือใส่รหัสห้องของเพื่อน</label><input id="in-code" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="" placeholder="เช่น 4821">
           <button class="btn ghost" data-act="join">เข้าห้อง</button>`}
       </section>
       ${standalone() ? '' : '<button class="btn ghost install-btn" data-act="install">📲 เพิ่มไปหน้าจอโฮม</button>'}`;
@@ -363,8 +461,10 @@
   // ---------- ช่วงวาง ----------
   function trayHTML() {
     return `<div class="tray">${S.st.fleet.map(id => {
-      const p = piece(id); const cls = ['tpiece']; if (S.sel === id && !S.islMode) cls.push('sel'); if (S.draft[id]) cls.push('placed');
-      return `<button class="${cls.join(' ')}" data-act="pick" data-id="${esc(id)}"><img src="${artURL(id)}" alt="" onerror="this.remove()"><span>${esc(p.name)} ${p.cells.length}</span></button>`;
+      const p = piece(id); const cls = ['tpiece'];
+      if (!S.islMode && (S.sel === id || (!S.sel && S.pick === id && !S.draft[id]))) cls.push('sel');
+      if (S.draft[id]) cls.push('placed');
+      return `<button class="${cls.join(' ')}" data-act="pick" data-id="${esc(id)}"><img src="${artURL(id)}" alt="" onerror="this.remove()"><span>${esc(p.name)} ${p.cells.length}</span>${S.draft[id] ? '<i class="ok">✓</i>' : ''}</button>`;
     }).join('')}</div>`;
   }
   function viewPlacing() {
@@ -373,27 +473,31 @@
     const others = S.st.players.filter(p => !p.removed && p.pid !== m.pid);
     const readyTxt = others.map(p => `${dot(p)}${esc(p.name)} ${p.ready ? '✓' : '…'}`).join(' · ');
     if (m.ready || !m.alive) {
+      const ol = ownLayers(m, m.placement);
       return `${header(timerHTML())}<div class="status"><span>${m.alive ? 'วางเสร็จแล้ว รอคนอื่น…' : 'คุณออกจากเกมนี้แล้ว'}</span></div>
         <div class="muted">${readyTxt}</div>${warnHTML()}
-        ${boardHTML({ board: 'me', islands: myIsl, pieces: (m.placement || []).map(p => ({ ...p, cls: 'mine' })) })}
+        ${boardHTML({ board: 'me', islands: myIsl, pieces: ol.pieces, outlines: ol.outlines, ownCells: ol.ownCells })}
         ${m.alive ? '<button class="btn danger" data-act="resign">ยอมแพ้</button>' : ''}`;
     }
     const draw = S.st.settings.islands === 'draw';
     const islSet = draw ? S.isl : myIsl;
-    const placed = Object.entries(S.draft).map(([id, v]) => ({ pieceId: id, ...v, cls: 'mine' }));
-    const marks = new Map();
-    for (const k of draftCells().keys()) marks.set(k, 'placed');
-    if (S.sel && !S.islMode) for (let r = 0; r < B(); r++) for (let c = 0; c < B(); c++) if (fits(S.sel, r, c, S.rot)) marks.set(kk(r, c), 'nostart');
+    if (S.sel && !S.draft[S.sel]) S.sel = null;
+    const ol = ownLayers(m, Object.entries(S.draft).map(([id, v]) => ({ pieceId: id, ...v })), S.islMode ? null : S.sel);
     const all = S.st.fleet.every(id => S.draft[id]);
     const islOk = !draw || islGroupsOk();
-    const sp = S.sel ? piece(S.sel) : null;
+    const nxt = S.pick && !S.draft[S.pick] ? S.pick : nextUnplaced();
+    let status;
+    if (S.islMode) status = `วาดเกาะ <b>${S.isl.size}/${S.st.config.ISLAND_CELLS}</b> ช่อง (เกาะละ ≥ ${S.st.config.ISLAND_MIN_GROUP} ช่องติดกัน)`;
+    else if (S.sel) status = `เลือก <b>${esc(piece(S.sel).name)}</b> — แตะช่องว่างเพื่อย้าย หรือกดค้างแล้วลาก`;
+    else if (nxt) status = `แตะช่องว่างเพื่อวาง <b>${esc(piece(nxt).name)}</b>`;
+    else status = 'วางครบแล้ว — แตะชิ้นเพื่อย้าย หมุน หรือเอาออก';
+    const tools = S.sel && !S.islMode ? `<div class="seltools"><button class="btn small" data-act="rot">หมุน ⟳</button><button class="btn ghost small" data-act="unplace">เอาออก ✕</button><button class="btn ghost small" data-act="desel">เสร็จ</button></div>` : '';
     return `${header(timerHTML())}
-      <div class="status"><span>${S.islMode ? `วาดเกาะ <b>${S.isl.size}/${S.st.config.ISLAND_CELLS}</b> ช่อง (เกาะละ ≥ ${S.st.config.ISLAND_MIN_GROUP} ช่องติดกัน)`
-        : sp ? `วาง <b>${esc(sp.name)}</b>` : 'วางครบแล้ว'}</span>
-        ${S.islMode ? '' : '<button class="btn ghost small" data-act="rot">หมุน ⟳</button>'}</div>
+      <div class="status"><span>${status}</span></div>
+      ${tools}
       <div class="muted">${readyTxt}</div>${warnHTML()}
-      ${boardHTML({ board: 'me', islands: islSet, marks, pieces: placed, clickable: () => 'place' })}
-      <div class="legend"><span>แตะช่อง = มุมซ้ายบนของชิ้น · แตะชิ้นบนกระดาน = ยกกลับ · ช่องแดง = เริ่มตรงนั้นไม่ได้</span>${S.st.settings.mode === 'survival' ? '<span>Survival: ของคนอื่นอาจทับช่องเดียวกับคุณได้ (มองไม่เห็น)</span>' : ''}</div>
+      ${boardHTML({ board: 'me', placing: true, islands: islSet, pieces: ol.pieces, outlines: ol.outlines, ownCells: ol.ownCells, clickable: () => 'place' })}
+      <div class="legend"><span>แตะช่องว่าง = วาง (ช่องที่แตะ = มุมซ้ายบนของชิ้น) · แตะชิ้น = เลือก แล้วย้าย หมุน เอาออก · กดค้างที่ชิ้นแล้วลากได้</span>${S.st.settings.mode === 'survival' ? '<span>Survival: ของคนอื่นอาจทับช่องเดียวกับคุณได้ (มองไม่เห็น)</span>' : ''}</div>
       ${trayHTML()}
       ${draw ? `<button class="btn ghost" data-act="islmode">${S.islMode ? 'กลับไปวางชิ้น' : `วาดเกาะ (${S.isl.size}/${S.st.config.ISLAND_CELLS})`}</button>` : ''}
       <div class="row"><button class="btn ghost" data-act="suggest">สุ่มวางให้</button><button class="btn" data-act="confirm" ${all && islOk ? '' : 'disabled'}>ยืนยัน</button></div>
@@ -446,35 +550,37 @@
     if (classic) {
       const tabs = [...opps, m].map(p => `<button class="tab ${S.tab === (p.pid === m.pid ? 'me' : p.pid) ? 'on' : ''}" data-act="tab" data-id="${p.pid === m.pid ? 'me' : esc(p.pid)}" style="--pc:${p.color}">${dot(p)}${p.pid === m.pid ? 'ของคุณ' : esc(p.name)}</button>`).join('');
       if (S.tab === 'me') {
-        const sl = sunkLayers([m]);
+        const sl = sunkLayers([m]); const ol = ownLayers(m, m.placement);
         boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: m.pid, cells: cellsMap(m.pid), islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
-          pieces: [...(m.placement || []).filter(p => !m.sunk.some(s => s.pieceId === p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines, sunkCells: sl.cells })}`;
+          pieces: [...ol.pieces, ...sl.pieces], outlines: [...ol.outlines, ...sl.outlines], ownCells: ol.ownCells, sunkCells: sl.cells })}`;
       } else {
         const o = pl(S.tab); const sl = sunkLayers([o]);
         boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: o.pid, cells: cellsMap(o.pid), marks, pieces: sl.pieces, outlines: sl.outlines, sunkCells: sl.cells,
           clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) })}`;
       }
     } else {
-      const sl = sunkLayers(st.players);
-      const mySunk = new Set(m.sunk.map(s => s.pieceId));
+      const sl = sunkLayers(st.players); const ol = ownLayers(m, m.placement);
       boardBlock = boardHTML({ board: '*', cells: cellsMap('*'), marks, islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
-        pieces: [...(m.placement || []).filter(p => !mySunk.has(p.pieceId)).map(p => ({ ...p, cls: 'mine' })), ...sl.pieces], outlines: sl.outlines, sunkCells: sl.cells,
+        pieces: [...ol.pieces, ...sl.pieces], outlines: [...ol.outlines, ...sl.outlines], ownCells: ol.ownCells, sunkCells: sl.cells,
         clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) });
     }
     const n = needShots();
     const dblCtl = myTurn && m.doubleBonus ? `<div class="row"><span class="muted">นัดคู่แนว</span><button class="btn ghost small ${S.dbl === 'H' ? 'on' : ''}" data-act="dbl" data-v="H">นอน ↔</button><button class="btn ghost small ${S.dbl === 'V' ? 'on' : ''}" data-act="dbl" data-v="V">ตั้ง ↕</button></div>` : '';
-    const fireBtn = myTurn ? `<button class="btn fire" data-act="fire" ${S.aim.length === n ? '' : 'disabled'}>ยิง! (${S.aim.length}/${n})</button>` : '';
+    // R-10-06 ปุ่มยิงติดขอบล่างจอ
+    const fireBtn = myTurn ? `<div class="firebar">${dblCtl}<button class="btn fire" data-act="fire" ${S.aim.length === n ? '' : 'disabled'}>ยิง! (${S.aim.length}/${n})</button>
+      <div class="muted center small">${S.aim.length ? 'ไม่กดยิงจนหมดเวลา = ยิงช่องที่เลือกไว้' : 'แตะช่องบนกระดานเพื่อเล็ง'}</div></div>` : '';
     return `${header(timerHTML())}
       <div class="status"><span>${status}</span><span class="zoomctl"><button class="btn ghost small" data-act="zoom" data-v="-1" aria-label="ย่อ">−</button><button class="btn ghost small" data-act="zoom" data-v="1" aria-label="ขยาย">+</button></span></div>
       ${m.autoStreak && m.alive ? `<div class="warn">ระบบยิงแทนคุณ ${m.autoStreak} ครั้งติดกันแล้ว ครบ 3 ครั้งจะตกรอบ</div>` : ''}
       ${warnHTML()}${summaryHTML()}
       ${boardBlock}
-      ${dblCtl}${fireBtn}
+      ${fireBtn}
       <div class="legend">${['miss', 'hit', 'island', 'trap'].map(s => `<span>${STATE_SVG[s]} ${LABEL[s]}</span>`).join('')}</div>
       ${m.alive ? '<button class="btn danger" data-act="resign">ยอมแพ้</button>' : '<button class="btn ghost" data-act="leave">ออกจากห้อง</button>'}`;
   }
 
   // ---------- จบเกม ----------
+  const ELIM_TXT = { sunk: 'ดับครบทุกชิ้น', auto_limit: 'ไม่ได้ยิงเอง 3 ตาติดกัน', resign: 'ยอมแพ้', disconnect: 'หลุดเกินเวลา' }; // R-9-07
   const REASON = { last_standing: 'เหลือรอดคนสุดท้าย', draw: 'ตกรอบพร้อมกันหมด', tiebreak_hits: 'ตกรอบพร้อมกัน ตัดสินด้วยจำนวนนัดที่ยิงโดนของคนอื่น', cancelled: 'ทุกคนหลุดหรือออก เกมถูกยกเลิก' };
   function viewOver() {
     const m = me(), res = S.st.result || {};
@@ -483,7 +589,8 @@
     const rk = Object.fromEntries((res.ranking || []).map(r => [r.pid, r.rank]));
     const rows = S.st.players.filter(p => p.pid in rk).sort((a, b) => rk[a.pid] - rk[b.pid]).map(p => {
       const s = p.stats || { shots: 0, hits: 0, hitsOnOthers: 0 };
-      return `<tr><td>${rk[p.pid]}</td><th>${dot(p)}${esc(p.name)}${p.pid === m.pid ? ' (คุณ)' : ''}</th><td>${s.shots}</td><td>${s.shots ? Math.round(s.hits / s.shots * 100) : 0}%</td><td>${s.hitsOnOthers}</td></tr>`;
+      const why = p.pid === res.winnerPid ? '<span class="why win">ผู้ชนะ</span>' : (res.elimReasons || {})[p.pid] ? `<span class="why">${esc(ELIM_TXT[res.elimReasons[p.pid]] || '')}</span>` : '';
+      return `<tr><td>${rk[p.pid]}</td><th>${dot(p)}${esc(p.name)}${p.pid === m.pid ? ' (คุณ)' : ''}${why}</th><td>${s.shots}</td><td>${s.shots ? Math.round(s.hits / s.shots * 100) : 0}%</td><td>${s.hitsOnOthers}</td></tr>`;
     }).join('');
     const classic = S.st.settings.mode === 'classic';
     const all = S.st.players.filter(p => p.placement);
@@ -535,14 +642,27 @@
   function updateTimer() {
     const t = $('#timer'); const s = secsLeft();
     if (t) { t.textContent = s == null ? '' : `${s} วิ`; t.classList.toggle('low', s != null && s <= 5); }
+    const bc = $('#bigcount'); // R-10-06 นับถอยหลังตัวใหญ่จางกลางจอ เฉพาะตาเรา
+    if (bc) { const on = S.st && S.st.phase === 'BATTLE' && S.session && canShoot() && s != null;
+      bc.hidden = !on; if (on) { if (bc.textContent !== String(s)) bc.textContent = s; bc.classList.toggle('low', s <= 5); } }
     document.querySelectorAll('.grace').forEach(g => { const n = g.querySelector('.graceN'); if (n) n.textContent = Math.max(0, +g.dataset.base - Math.floor((Date.now() - S.recvAt) / 1000)); });
   }
   setInterval(updateTimer, 250);
 
+  // R-8-12 ส่งช่องที่เลือกไว้ให้ server (หมดเวลาแล้วยิงช่องนี้เป็นการยิงเอง)
+  function aimShots() {
+    const m = me();
+    return S.aim.map((x, i) => ({ row: x.row, col: x.col, ...(x.board !== '*' ? { board: x.board } : {}), ...(i === 0 && m && m.doubleBonus ? { double: S.dbl } : {}) }));
+  }
+  function syncAim() {
+    clearTimeout(syncAim.t);
+    syncAim.t = setTimeout(() => { if (S.st && S.st.phase === 'BATTLE' && canShoot()) emit('action', { type: 'aim', turnNo: S.st.turnNo, shots: aimShots() }); }, 120);
+  }
+
   // ---------- คลิก ----------
   document.addEventListener('input', e => {
     if (e.target.id === 'in-name') { S.name = e.target.value; store.set('bw_name', S.name); }
-    if (e.target.id === 'in-code') S.code = e.target.value.toUpperCase();
+    if (e.target.id === 'in-code') { const v = e.target.value.replace(/\D/g, '').slice(0, 4); if (v !== e.target.value) e.target.value = v; S.code = v; } // R-5-01 ตัวเลข 4 หลัก
   });
   document.addEventListener('change', async e => {
     const k = e.target.dataset && e.target.dataset.set; if (!k) return;
@@ -552,13 +672,14 @@
   function saveSession(s) { S.session = s; ss.set('bw_session', s); store.set('bw_session', s); }
   document.addEventListener('click', async e => {
     const el = e.target.closest('[data-act]'); if (!el) return;
+    if (S.dragEndAt && Date.now() - S.dragEndAt < 400 && el.dataset.act === 'place') return; // คลิกที่ตามหลังการลาก
     const a = el.dataset.act; const r = +el.dataset.r, c = +el.dataset.c;
     switch (a) {
       case 'age-ok': S.ageOk = true; store.set('bw_age_ok', true); return render();
       case 'age-no': location.href = 'about:blank'; return;
       case 'create': case 'join': {
         const name = ($('#in-name') || {}).value || '';
-        const code = (($('#in-code') || {}).value || '').trim().toUpperCase();
+        const code = (($('#in-code') || {}).value || '').replace(/\D/g, '');
         if (a === 'join' && !code) return toast('ใส่รหัสห้องก่อน');
         el.disabled = true;
         const res = await emit(a, a === 'join' ? { code, name } : { name });
@@ -572,8 +693,10 @@
         else { try { await navigator.clipboard.writeText(el.dataset.link); toast('คัดลอกลิงก์แล้ว'); } catch (x) { toast(el.dataset.link); } }
         return;
       case 'start': await act('start_game'); return;
-      case 'pick': S.islMode = false; S.sel = el.dataset.id; if (S.draft[S.sel]) { S.rot = S.draft[S.sel].rot; delete S.draft[S.sel]; } return render();
-      case 'rot': S.rot = (S.rot + 1) % 4; return render();
+      case 'pick': { S.islMode = false; const id = el.dataset.id; if (S.draft[id]) S.sel = S.sel === id ? null : id; else { S.pick = id; S.sel = null; } return render(); }
+      case 'rot': return rotateSel();
+      case 'unplace': return removeSel();
+      case 'desel': S.sel = null; return render();
       case 'islmode': S.islMode = !S.islMode; return render();
       case 'place': return placeAt(r, c);
       case 'suggest': {
@@ -581,7 +704,7 @@
         if (res.ok && res.placement) {
           S.draft = {}; for (const p of res.placement) S.draft[p.pieceId] = { row: p.row, col: p.col, rot: p.rot };
           if (res.islands) S.isl = new Set(res.islands.map(([y, x]) => kk(y, x)));
-          S.sel = null; S.islMode = false; render();
+          S.sel = null; S.pick = null; S.islMode = false; render();
         }
         return;
       }
@@ -597,13 +720,13 @@
         const i = S.aim.findIndex(x => x.board === board && x.row === r && x.col === c);
         if (i >= 0) S.aim.splice(i, 1);
         else { if (S.aim.length >= needShots()) S.aim.shift(); S.aim.push({ board, row: r, col: c }); }
+        syncAim();
         return render();
       }
-      case 'dbl': S.dbl = el.dataset.v; return render();
+      case 'dbl': S.dbl = el.dataset.v; syncAim(); return render();
       case 'fire': {
-        const m = me();
-        const shots = S.aim.map((x, i) => ({ row: x.row, col: x.col, ...(x.board !== '*' ? { board: x.board } : {}), ...(i === 0 && m.doubleBonus ? { double: S.dbl } : {}) }));
-        el.disabled = true;
+        const shots = aimShots();
+        el.disabled = true; clearTimeout(syncAim.t);
         const res = await act('fire', { turnNo: S.st.turnNo, shots });
         if (res.ok) S.aim = [];
         return render();
@@ -642,6 +765,7 @@
     return false;
   }
   document.addEventListener('touchmove', e => {
+    if (S.drag && e.touches.length === 1) { const t = e.touches[0]; if (dragMove(t.clientX, t.clientY)) { e.preventDefault(); return; } }
     if (pinch && e.touches.length === 2) {
       e.preventDefault();
       const [a, b] = e.touches; const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
