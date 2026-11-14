@@ -590,6 +590,50 @@ test('T-54 รหัสห้องเป็นตัวเลข 4 หลัก
   assert.ok(/^[0-9]+$/.test(CONFIG.ROOM_CODE_CHARS));
 });
 
+// ---------- v2.3 ห้องรอ ----------
+test('T-57 ชื่อห้อง/ส่วนตัว/รหัสผ่าน ตรวจค่า [R-5-09, R-5-10]', () => {
+  const x = start(2, { mode: 'classic' });
+  const r = new (x.room.constructor)('1234', { cards: CARDS });
+  throwsCode(() => r.setMeta({ name: '   ' }), 'ROOM_NAME_INVALID');
+  throwsCode(() => r.setMeta({ name: 'ก'.repeat(21) }), 'ROOM_NAME_INVALID');
+  throwsCode(() => r.setMeta({ private: true }), 'PASSWORD_INVALID');
+  throwsCode(() => r.setMeta({ private: true, password: '12a4' }), 'PASSWORD_INVALID');
+  throwsCode(() => r.setMeta({ private: true, password: '123' }), 'PASSWORD_INVALID');
+  r.setMeta({ name: ' ห้อง  สายเขียว ', private: true, password: '0420' });
+  assert.deepStrictEqual(r.meta, { name: 'ห้อง สายเขียว', private: true, password: '0420' });
+  r.setMeta({ private: false });
+  assert.strictEqual(r.meta.password, null);
+});
+test('T-58 ห้องส่วนตัว: รหัสผ่านผิด = BAD_PASSWORD · ถูก = เข้าได้ · ห้องสาธารณะไม่ต้องใช้ [R-5-11]', () => {
+  const r = new (start(2, {}).room.constructor)('5678', { cards: CARDS });
+  r.addPlayer('เอ'); r.setMeta({ name: 'ห้องเอ', private: true, password: '4821' });
+  throwsCode(() => r.checkPassword('1111'), 'BAD_PASSWORD');
+  throwsCode(() => r.checkPassword(undefined), 'BAD_PASSWORD');
+  r.checkPassword('4821');
+  r.setMeta({ private: false }); r.checkPassword(undefined);
+});
+test('T-59 รายการห้องไม่มีรหัสผ่าน · สถานะ open/full/playing [R-5-12]', () => {
+  const r = new (start(2, {}).room.constructor)('2468', { cards: CARDS });
+  const a = r.addPlayer('เอ'); r.setMeta({ name: 'ห้องเอ', private: true, password: '9999' });
+  let sm = r.summary();
+  assert.ok(!JSON.stringify(sm).includes('9999'));
+  assert.strictEqual(sm.status, 'open'); assert.strictEqual(sm.private, true); assert.strictEqual(sm.host, 'เอ'); assert.strictEqual(sm.players, 1);
+  for (let i = 2; i <= 7; i++) r.addPlayer('p' + i);
+  assert.strictEqual(r.summary().status, 'full');
+  const x = start(2, {}); assert.strictEqual(x.room.summary().status, 'playing');
+  r.players.forEach(p => { p.connected = false; }); assert.strictEqual(r.listed(), false);
+});
+test('T-60 เปลี่ยนชื่อห้อง/รหัสผ่านได้เฉพาะ host ใน LOBBY/GAME_OVER · คนในห้องเห็นรหัสผ่าน [R-5-10]', () => {
+  const r = new (start(2, {}).room.constructor)('1357', { cards: CARDS });
+  const a = r.addPlayer('เอ'); const b = r.addPlayer('บี');
+  throwsCode(() => r.action(b.pid, { type: 'room_meta', meta: { name: 'x' } }), 'NOT_HOST');
+  r.action(a.pid, { type: 'room_meta', meta: { name: 'ห้องใหม่', private: true, password: '1234' } });
+  assert.strictEqual(r.getState(b.pid).room.password, '1234');
+  assert.strictEqual(r.getState(b.pid).room.name, 'ห้องใหม่');
+  const x = start(2, {});
+  throwsCode(() => x.room.action(x.room.hostPid, { type: 'room_meta', meta: { name: 'y' } }), 'BAD_PHASE');
+});
+
 let fail = 0;
 for (const [name, fn] of tests) {
   try { fn(); console.log('ok   ' + name); } catch (e) { fail++; console.log('FAIL ' + name + '\n     ' + (e.stack || e).split('\n').slice(0, 3).join('\n     ')); }

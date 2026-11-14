@@ -1,4 +1,4 @@
-/* Battle Weed: Green Social v2.2 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
+/* Battle Weed: Green Social v2.3 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
 (function () {
   'use strict';
   const $ = s => document.querySelector(s);
@@ -22,7 +22,10 @@
     session: ss.get('bw_session') || store.get('bw_session'),
     cat: new Map(), fit: {}, ver: '0',
     st: null, offset: 0, recvAt: 0,
-    name: store.get('bw_name') || '', code: (qs.get('room') || '').replace(/\D/g, '').slice(0, 4),
+    name: store.get('bw_name') || '',
+    // v2.3 ห้องรอ: ลิงก์เชิญ ?room=1234&pw=0420 (R-5-14)
+    invite: { code: (qs.get('room') || '').replace(/\D/g, '').slice(0, 4), pw: (qs.get('pw') || '').replace(/\D/g, '').slice(0, 4), room: null, looked: false },
+    rooms: [], listOn: false, createOpen: false, newRoom: { name: '', priv: false, pw: '' },
     // วาง
     draft: {}, sel: null, pick: null, drag: null, placingGame: 0, islMode: false, isl: new Set(),
     // ยิง
@@ -58,7 +61,8 @@
   // ---------- socket ----------
   const socket = io({ transports: ['websocket', 'polling'] });
   const net = $('#net');
-  socket.on('connect', () => { net.hidden = true; S.restoreAim = true; if (S.session && !S.replaced) resume(); });
+  socket.on('connect', () => { net.hidden = true; S.restoreAim = true; S.listOn = false; if (S.session && !S.replaced) resume(); else render(); });
+  socket.on('rooms', list => { S.rooms = list || []; if (!S.session) render(); });   // R-5-12
   socket.on('disconnect', reason => { if (reason !== 'io server disconnect') net.hidden = false; });
   socket.on('replaced', () => { S.replaced = true; render(); });
   socket.on('state', st => {
@@ -86,8 +90,9 @@
       if (!r || !r.ok) {
         const quiet = ['STALE_TURN', 'BAD_PHASE', 'ALREADY_PLACED', 'OUT_OF_BOUNDS', 'BAD_REQUEST', 'NOT_HOST', 'SHOT_COUNT', 'ALREADY_SUBMITTED'];
         if (payload && payload.type === 'aim') quiet.push('NOT_YOUR_TURN', 'DOUBLE_INVALID', 'ALREADY_SHOT', 'BAD_TARGET');
+        if (ev === 'find_room' || ev === 'list_rooms') quiet.push('ROOM_NOT_FOUND');
         if (r && !quiet.includes(r.code)) toast(r.error || 'ทำไม่สำเร็จ');
-        if (r && (r.code === 'ROOM_NOT_FOUND' || r.code === 'BAD_TOKEN')) dropSession();
+        if (r && (r.code === 'ROOM_NOT_FOUND' || r.code === 'BAD_TOKEN') && ev !== 'find_room' && ev !== 'join') dropSession();
       }
       res(r || { ok: false });
     }));
@@ -407,23 +412,66 @@
     if (/iphone|ipad|ipod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'ios';
     return 'menu';
   }
+  // ---------- หน้าแรก + รายการห้อง (v2.3 R-5-12 ถึง R-5-14) ----------
+  function ensureList() {
+    if (S.listOn || S.session || !socket.connected) return;
+    S.listOn = true;
+    emit('list_rooms', {}).then(r => { if (r.ok) { S.rooms = r.rooms || []; render(); } else S.listOn = false; });
+  }
+  function lookInvite() {
+    const iv = S.invite; if (!iv.code || iv.looked || !socket.connected) return;
+    iv.looked = true;
+    emit('find_room', { code: iv.code }).then(r => { iv.room = r.ok ? r.room : null; if (!r.ok) iv.code = ''; render(); });
+  }
+  const ISL_TAG = { random: 'เกาะสุ่ม', draw: 'เกาะวาดเอง' };
+  function roomTags(rm) {
+    const t = [`${rm.players}/${rm.max} คน`, rm.settings.mode === 'survival' ? 'Survival' : 'Classic'];
+    if (rm.settings.islands !== 'off') t.push(ISL_TAG[rm.settings.islands]);
+    if (rm.settings.traps) t.push('กับดัก');
+    if (rm.settings.bonusOnHit) t.push('โดนแล้วยิงต่อ');
+    return t.map(x => `<span class="tag">${esc(x)}</span>`).join('');
+  }
+  function roomCard(rm, pw) {
+    const st = rm.status === 'open' ? `<button class="btn small" data-act="join-room" data-code="${esc(rm.code)}" data-priv="${rm.private ? 1 : 0}"${pw ? ` data-pw="${esc(pw)}"` : ''}>เข้าร่วม</button>`
+      : `<span class="tag stat">${rm.status === 'full' ? 'เต็ม' : 'กำลังเล่น'}</span>`;
+    return `<div class="rcard ${rm.status}"><div class="rinfo"><div class="rname">${rm.private ? '🔒 ' : ''}${esc(rm.name)}</div>
+      <div class="muted small">โดย ${esc(rm.host)} · #${esc(rm.code)}</div><div class="tags">${roomTags(rm)}</div></div>${st}</div>`;
+  }
   function viewHome() {
+    ensureList(); lookInvite();
+    const iv = S.invite; const nr = S.newRoom;
+    const create = S.createOpen ? `<section class="panel"><h2>สร้างห้อง</h2>
+        <label for="in-rname">ชื่อห้อง</label><input id="in-rname" maxlength="20" value="${esc(nr.name)}" placeholder="ห้องของ ${esc(S.name || 'คุณ')}">
+        <div class="optgrp"><label class="opt"><input type="radio" name="npriv" value="0" data-new="priv" ${nr.priv ? '' : 'checked'}> สาธารณะ — ใครก็กดเข้าได้</label>
+        <label class="opt"><input type="radio" name="npriv" value="1" data-new="priv" ${nr.priv ? 'checked' : ''}> 🔒 ส่วนตัว — ต้องใส่รหัสผ่าน</label></div>
+        ${nr.priv ? `<label for="in-npw">รหัสผ่าน (ตัวเลข 4 หลัก)</label><input id="in-npw" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${esc(nr.pw)}">` : ''}
+        <div class="row"><button class="btn ghost" data-act="create-cancel">ยกเลิก</button><button class="btn" data-act="create">สร้างห้อง</button></div></section>` : '';
+    const list = S.rooms.length ? S.rooms.map(rm => roomCard(rm)).join('') : '<p class="muted center">ยังไม่มีห้องที่เปิดอยู่ — สร้างห้องแรกได้เลย</p>';
     return `<div class="stripe"></div><div class="brand"><img class="logo" src="/icons/icon-192.png" alt=""><h1>Battle Weed: Green Social</h1></div>
       <p class="muted">ซ่อนอุปกรณ์สายเขียวบนกระดาน แล้วยิงหาของเพื่อน ใครเหลือรอดคนสุดท้ายชนะ เล่นได้ 2–7 คน</p>
       ${S.lost ? `<div class="warn">${esc(S.lost)}</div>` : ''}
       <section class="panel">
         <label for="in-name">ชื่อของคุณ</label>
         <input id="in-name" maxlength="16" autocomplete="nickname" value="${esc(S.name)}" placeholder="เช่น เอ">
-        ${S.code ? `<label for="in-code">รหัสห้อง</label><input id="in-code" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${esc(S.code)}">
-          <button class="btn" data-act="join">เข้าห้อง ${esc(S.code)}</button><button class="btn ghost" data-act="create">สร้างห้องใหม่แทน</button>`
-        : `<button class="btn" data-act="create">สร้างห้อง</button>
-          <label for="in-code">หรือใส่รหัสห้องของเพื่อน</label><input id="in-code" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="" placeholder="เช่น 4821">
-          <button class="btn ghost" data-act="join">เข้าห้อง</button>`}
+        ${S.createOpen ? '' : '<div class="row"><button class="btn" data-act="create-open">สร้างห้อง</button><button class="btn ghost" data-act="find-open">🔍 ค้นหาห้อง</button></div>'}
       </section>
+      ${iv.code && iv.room ? `<section class="panel invite"><h2>คำเชิญเข้าห้อง</h2>${roomCard(iv.room, iv.pw)}</section>` : ''}
+      ${create}
+      <section class="panel"><h2>ห้องที่เปิดอยู่ <span class="muted small">(${S.rooms.filter(r => r.status === 'open').length} ห้องรอคน)</span></h2><div class="rlist">${list}</div></section>
       ${standalone() ? '' : '<button class="btn ghost install-btn" data-act="install">📲 เพิ่มไปหน้าจอโฮม</button>'}`;
   }
+  async function joinRoom(code, pw, el) {
+    const name = (($('#in-name') || {}).value || S.name || '').trim();
+    if (!name) { toast('ใส่ชื่อของคุณก่อน'); const f = $('#in-name'); if (f) f.focus(); return; }
+    if (el) el.disabled = true;
+    const res = await emit('join', { code, name, password: pw || undefined });
+    if (el) el.disabled = false;
+    if (res.ok) { S.modal = null; S.invite = { code: '', pw: '', room: null, looked: true }; saveSession({ code: res.code, playerId: res.pid, token: res.token }); S.lost = null; S.listOn = false; history.replaceState(null, '', '/'); }
+    else if (res.code === 'BAD_PASSWORD') { S.modal = { type: 'pw', code, wrong: true }; render(); }
+  }
   function header(extra) {
-    return `<div class="row head"><h2>ห้อง ${esc(S.st.code)}</h2>${extra || ''}</div>`;
+    const rn = S.st.room && S.st.room.name;
+    return `<div class="row head"><h2>${rn ? esc(rn) : 'ห้อง ' + esc(S.st.code)}${S.st.room && S.st.room.private ? ' 🔒' : ''}</h2>${extra || ''}</div>`;
   }
   const dot = p => `<i class="pdot" style="background:${p.color}"></i>`;
   function playersHTML() {
@@ -441,13 +489,26 @@
       <div class="optgrp"><span class="muted">เกาะส่วนตัว</span>${['off', 'random', 'draw'].map(v => opt('islands', v, s.islands, ISL_TXT[v])).join('')}</div>
       <label class="opt"><input type="checkbox" ${s.traps ? 'checked' : ''} ${dis} data-set="traps"> ช่องกับดัก</label></section>`;
   }
+  // R-5-10 / R-5-14 ลิงก์เชิญของห้องส่วนตัวมีรหัสผ่านติดไป
+  const inviteLink = () => `${location.origin}/?room=${S.st.code}${S.st.room && S.st.room.private && S.st.room.password ? `&pw=${S.st.room.password}` : ''}`;
+  function roomMetaHTML() {
+    const rm = S.st.room || {};
+    if (!isHost()) return rm.private ? `<p class="muted center">🔒 ห้องส่วนตัว · รหัสผ่าน <b>${esc(rm.password || '')}</b></p>` : '<p class="muted center">ห้องสาธารณะ — ขึ้นในรายการหน้าแรก</p>';
+    return `<section class="panel"><h2>ห้อง</h2>
+      <label for="in-mname">ชื่อห้อง</label><input id="in-mname" maxlength="20" value="${esc(rm.name || '')}" data-meta="name">
+      <div class="optgrp"><label class="opt"><input type="radio" name="mpriv" value="0" data-meta="private" ${rm.private ? '' : 'checked'}> สาธารณะ</label>
+      <label class="opt"><input type="radio" name="mpriv" value="1" data-meta="private" ${rm.private ? 'checked' : ''}> 🔒 ส่วนตัว</label></div>
+      ${rm.private ? `<label for="in-mpw">รหัสผ่าน (ตัวเลข 4 หลัก)</label><input id="in-mpw" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${esc(rm.password || '')}" data-meta="password">` : ''}
+      <p class="muted small">${rm.private ? 'ห้องขึ้นในรายการพร้อม 🔒 คนอื่นต้องใส่รหัสผ่าน ส่วนลิงก์ด้านบนมีรหัสผ่านติดไปแล้ว' : 'ห้องขึ้นในรายการหน้าแรก ใครก็กดเข้าได้'}</p></section>`;
+  }
   function viewLobby() {
-    const link = `${location.origin}/?room=${S.st.code}`;
+    const link = inviteLink();
     const n = S.st.players.filter(p => !p.removed && p.connected).length;
     return `${header('<button class="btn ghost small" data-act="leave">ออก</button>')}
-      <section class="panel center"><p class="muted">ส่งรหัสหรือลิงก์ให้เพื่อน (2–7 คน)</p>
-        <div class="code">${esc(S.st.code)}</div>
+      <section class="panel center"><p class="muted">ส่งลิงก์ให้เพื่อน หรือให้เพื่อนกดเข้าจากรายการห้อง (2–7 คน)</p>
+        <div class="code">#${esc(S.st.code)}</div>
         <div class="row wide"><button class="btn" data-act="share" data-link="${esc(link)}">แชร์ลิงก์</button><button class="btn ghost" data-act="copy" data-link="${esc(link)}">คัดลอก</button></div></section>
+      ${roomMetaHTML()}
       <section class="panel"><div class="players">${playersHTML()}</div></section>
       ${settingsHTML(isHost())}
       ${isHost() ? `<button class="btn" data-act="start" ${n < 2 ? 'disabled' : ''}>เริ่มเกม (${n} คน)</button>` : '<p class="muted center">รอหัวห้องกดเริ่มเกม…</p>'}`;
@@ -623,6 +684,14 @@
 
   function viewModal() {
     const mm = S.modal;
+    if (mm.type === 'find') return `<div class="modal"><section class="panel narrow"><h2>🔍 ค้นหาห้อง</h2>
+      <label for="in-find">รหัสห้อง (ตัวเลข 4 หลัก)</label><input id="in-find" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${esc(mm.q || '')}" placeholder="เช่น 4821">
+      <div class="row"><button class="btn ghost" data-act="close">ปิด</button><button class="btn" data-act="find-go">ค้นหา</button></div>
+      ${mm.room ? roomCard(mm.room) : mm.none ? '<p class="muted center">ไม่พบห้องนี้</p>' : ''}</section></div>`;
+    if (mm.type === 'pw') return `<div class="modal"><section class="panel narrow"><h2>🔒 ห้องส่วนตัว</h2>
+      <label for="in-pw">รหัสผ่าน (ตัวเลข 4 หลัก)</label><input id="in-pw" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="">
+      ${mm.wrong ? '<p class="warn small">รหัสผ่านไม่ถูกต้อง</p>' : ''}
+      <div class="row"><button class="btn ghost" data-act="close">ยกเลิก</button><button class="btn" data-act="pw-go" data-code="${esc(mm.code)}">เข้าห้อง</button></div></section></div>`;
     if (mm.type === 'resign') return `<div class="modal"><section class="panel narrow"><h2>ยอมแพ้เกมนี้?</h2><p class="muted">คุณจะตกรอบทันที</p>
       <div class="row"><button class="btn danger" data-act="resign-yes">ยอมแพ้</button><button class="btn" data-act="close">เล่นต่อ</button></div></section></div>`;
     if (mm.type === 'sunk') return `<div class="modal" data-act="close"><section class="panel narrow center"><img class="bigpiece" src="${artURL(mm.piece)}" alt=""><h2>${esc(piece(mm.piece).name)}ของ ${esc((pl(mm.owner) || {}).name || '')}</h2><p class="muted">แตะเพื่อปิด</p></section></div>`;
@@ -662,13 +731,26 @@
   // ---------- คลิก ----------
   document.addEventListener('input', e => {
     if (e.target.id === 'in-name') { S.name = e.target.value; store.set('bw_name', S.name); }
-    if (e.target.id === 'in-code') { const v = e.target.value.replace(/\D/g, '').slice(0, 4); if (v !== e.target.value) e.target.value = v; S.code = v; } // R-5-01 ตัวเลข 4 หลัก
+    if (['in-find', 'in-pw', 'in-npw', 'in-mpw'].includes(e.target.id)) { const v = e.target.value.replace(/\D/g, '').slice(0, 4); if (v !== e.target.value) e.target.value = v; } // R-5-01 / R-5-10 ตัวเลข 4 หลัก
+    if (e.target.id === 'in-find' && S.modal) S.modal.q = e.target.value;
+    if (e.target.id === 'in-rname') S.newRoom.name = e.target.value;
+    if (e.target.id === 'in-npw') S.newRoom.pw = e.target.value;
   });
   document.addEventListener('change', async e => {
-    const k = e.target.dataset && e.target.dataset.set; if (!k) return;
+    const d = e.target.dataset || {};
+    if (d.new === 'priv') { S.newRoom.priv = e.target.value === '1'; if (S.newRoom.priv && !S.newRoom.pw) S.newRoom.pw = randPw(); return render(); }
+    if (d.meta) { // R-5-10 host แก้ชื่อห้อง / ส่วนตัว / รหัสผ่าน
+      const rm = S.st.room || {}; let meta;
+      if (d.meta === 'name') meta = { name: e.target.value };
+      else if (d.meta === 'private') meta = e.target.value === '1' ? { private: true, password: rm.password || randPw() } : { private: false };
+      else { if (!/^[0-9]{4}$/.test(e.target.value)) { toast('รหัสผ่านต้องเป็นตัวเลข 4 หลัก'); return render(); } meta = { password: e.target.value }; }
+      const r = await act('room_meta', { meta }); if (!r.ok) render(); return;
+    }
+    const k = d.set; if (!k) return;
     const v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
     await act('update_settings', { settings: { [k]: v } });
   });
+  const randPw = () => String(Math.floor(Math.random() * 10000)).padStart(4, '0');
   function saveSession(s) { S.session = s; ss.set('bw_session', s); store.set('bw_session', s); }
   document.addEventListener('click', async e => {
     const el = e.target.closest('[data-act]'); if (!el) return;
@@ -677,14 +759,31 @@
     switch (a) {
       case 'age-ok': S.ageOk = true; store.set('bw_age_ok', true); return render();
       case 'age-no': location.href = 'about:blank'; return;
-      case 'create': case 'join': {
-        const name = ($('#in-name') || {}).value || '';
-        const code = (($('#in-code') || {}).value || '').replace(/\D/g, '');
-        if (a === 'join' && !code) return toast('ใส่รหัสห้องก่อน');
+      case 'create-open': if (!(S.name || '').trim()) { toast('ใส่ชื่อของคุณก่อน'); return; } S.createOpen = true; return render();
+      case 'create-cancel': S.createOpen = false; return render();
+      case 'create': {
+        const name = (($('#in-name') || {}).value || '').trim();
+        if (!name) return toast('ใส่ชื่อของคุณก่อน');
+        const nr = S.newRoom;
+        if (nr.priv && !/^[0-9]{4}$/.test(nr.pw)) return toast('รหัสผ่านต้องเป็นตัวเลข 4 หลัก');
         el.disabled = true;
-        const res = await emit(a, a === 'join' ? { code, name } : { name });
+        const res = await emit('create', { name, roomName: nr.name.trim() || undefined, private: nr.priv, password: nr.priv ? nr.pw : undefined });
         el.disabled = false;
-        if (res.ok) { saveSession({ code: res.code, playerId: res.pid, token: res.token }); S.lost = null; history.replaceState(null, '', '/'); }
+        if (res.ok) { S.createOpen = false; S.newRoom = { name: '', priv: false, pw: '' }; saveSession({ code: res.code, playerId: res.pid, token: res.token }); S.lost = null; S.listOn = false; history.replaceState(null, '', '/'); }
+        return;
+      }
+      case 'join-room': {
+        const code = el.dataset.code;
+        if (el.dataset.priv === '1' && !el.dataset.pw) { if (!(($('#in-name') || {}).value || S.name || '').trim()) { toast('ใส่ชื่อของคุณก่อน'); return; } S.modal = { type: 'pw', code }; return render(); }
+        return joinRoom(code, el.dataset.pw, el);
+      }
+      case 'pw-go': { const pw = (($('#in-pw') || {}).value || ''); if (!/^[0-9]{4}$/.test(pw)) return toast('รหัสผ่านต้องเป็นตัวเลข 4 หลัก'); return joinRoom(el.dataset.code, pw, el); }
+      case 'find-open': S.modal = { type: 'find', q: '' }; return render();
+      case 'find-go': { // R-5-13
+        const q = (($('#in-find') || {}).value || '');
+        if (q.length !== 4) return toast('ใส่รหัสห้อง 4 หลัก');
+        const r = await emit('find_room', { code: q });
+        if (S.modal && S.modal.type === 'find') { S.modal = { type: 'find', q, room: r.ok ? r.room : null, none: !r.ok }; render(); }
         return;
       }
       case 'copy': try { await navigator.clipboard.writeText(el.dataset.link); toast('คัดลอกลิงก์แล้ว'); } catch (x) { toast(el.dataset.link); } return;

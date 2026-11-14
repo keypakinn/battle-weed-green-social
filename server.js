@@ -41,6 +41,17 @@ function newCode() {
 }
 const logEvent = e => console.log(JSON.stringify(e)); // หัวข้อ 12: event log ไม่มี token
 
+// R-5-12 รายการห้อง (ห้องที่มีคนเชื่อมต่ออยู่อย่างน้อย 1 คน) เรียง: รอเริ่ม → เต็ม → กำลังเล่น แล้วห้องใหม่ก่อน
+let listDirty = true; let lastList = '';
+const ORDER = { open: 0, full: 1, playing: 2 };
+function roomList() {
+  return [...rooms.values()].filter(r => r.listed()).map(r => r.summary())
+    .sort((a, b) => ORDER[a.status] - ORDER[b.status]).slice(0, 100);
+}
+function pushList() {
+  const list = roomList(); const j = JSON.stringify(list);
+  if (j !== lastList) { lastList = j; io.to('roomlist').emit('rooms', list); }
+}
 const pending = new Set();
 function scheduleBroadcast(room) {
   if (pending.has(room)) return;
@@ -48,6 +59,7 @@ function scheduleBroadcast(room) {
   setImmediate(() => {
     pending.delete(room);
     try { broadcast(room); } catch (e) { console.error('[broadcast]', e); }
+    listDirty = true;
   });
 }
 function broadcast(room) {
@@ -97,10 +109,13 @@ const obj = p => (p && typeof p === 'object' ? p : {});
 io.on('connection', socket => {
   socket.on('create', (p, ack) => safe(ack, () => {
     if (!CARDS.ready) throw notReady();                    // R-5-01
+    const q = obj(p);
     const code = newCode();
     const room = new Room(code, { cards: CARDS.cards, onLog: logEvent });
-    const { pid, token } = room.addPlayer(obj(p).name);
-    rooms.set(code, room);
+    const { pid, token } = room.addPlayer(q.name);
+    const nm = typeof q.roomName === 'string' && q.roomName.trim() ? q.roomName : `ห้องของ ${room.seat(pid).name}`.slice(0, CONFIG.ROOM_NAME_MAX);
+    room.setMeta({ name: nm, private: q.private === true, password: q.private === true ? q.password : null }); // R-5-09, R-5-10
+    rooms.set(code, room); listDirty = true; socket.leave('roomlist');
     detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
     return { code, pid, token };
   }));
@@ -108,7 +123,10 @@ io.on('connection', socket => {
     const code = String(obj(p).code || '').replace(/\s/g, '').toUpperCase().slice(0, 10);
     const room = rooms.get(code);
     if (!room) throw new GameError('ROOM_NOT_FOUND', 'ไม่พบห้องนี้');   // R-5-04
+    if (room.phase !== 'LOBBY') throw new GameError('ROOM_FULL', 'ห้องนี้กำลังเล่นอยู่');
+    room.checkPassword(obj(p).password);                                  // R-5-11
     const { pid, token } = room.addPlayer(obj(p).name);
+    socket.leave('roomlist');
     detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
     return { code, pid, token };
   }));
@@ -136,6 +154,15 @@ io.on('connection', socket => {
     scheduleBroadcast(room);
     return r && r.placement !== undefined ? { placement: r.placement, islands: r.islands } : {};
   }));
+  // [ใหม่ v2.3] R-5-12 รายการห้อง: หน้าแรกสมัครรับ อัปเดตเมื่อมีการเปลี่ยน
+  socket.on('list_rooms', (p, ack) => safe(ack, () => { socket.join('roomlist'); return { rooms: roomList() }; }));
+  socket.on('unlist_rooms', (p, ack) => safe(ack, () => { socket.leave('roomlist'); return {}; }));
+  socket.on('find_room', (p, ack) => safe(ack, () => {                   // R-5-13 ค้นหาด้วยรหัสห้อง
+    const code = String(obj(p).code || '').replace(/\D/g, '').slice(0, 4);
+    const room = rooms.get(code);
+    if (!room) throw new GameError('ROOM_NOT_FOUND', 'ไม่พบห้องนี้');
+    return { room: room.summary() };
+  }));
   socket.on('disconnect', () => { try { detach(socket); } catch (e) { console.error('[disconnect]', e); } });
 });
 
@@ -145,12 +172,13 @@ setInterval(() => {
     try {
       if (room.tick()) scheduleBroadcast(room);
       if (room.expired()) {
-        rooms.delete(code);
+        rooms.delete(code); listDirty = true;
         for (const [sid, v] of sockRoom) if (v.code === code) sockRoom.delete(sid);
         logEvent({ t: Date.now(), room: code, type: 'room_closed' });
       }
     } catch (e) { console.error('[tick]', code, e); }
   }
+  if (listDirty) { listDirty = false; try { pushList(); } catch (e) { console.error('[list]', e); } }
 }, 500);
 
 const PORT = Number(process.env.PORT) || 3000;

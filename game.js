@@ -1,5 +1,5 @@
 'use strict';
-// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.2) — ไม่ import express/socket.io
+// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.3) — ไม่ import express/socket.io
 // รหัสกติกา R-x-yy อ้างถึงหัวข้อใน spec.md
 const crypto = require('crypto');
 
@@ -35,6 +35,8 @@ const CONFIG = Object.freeze({
   ROOM_CODE_LEN: 4,                 // [แก้ v2.2] รหัสห้องตัวเลข 4 หลัก ตัวแรกไม่ใช่ 0
   ROOM_CODE_CHARS: '0123456789',
   NAME_MAX: 16,
+  ROOM_NAME_MAX: 20,                // [ใหม่ v2.3] R-5-09
+  ROOM_PASSWORD_RE: /^[0-9]{4}$/,   // [ใหม่ v2.3] R-5-10 รหัสผ่านตัวเลข 4 หลัก
   MIN_AGE: 20,
   PLAYER_COLORS: ['#F2C230', '#FF5FA2', '#F5F5F5', '#E53935', '#A1673A', '#FFB74D', '#3F51B5'],
   REQID_MEMORY: 50,
@@ -66,6 +68,7 @@ class GameError extends Error {
   constructor(code, message, reason) { super(message); this.code = code; this.reason = reason; }
 }
 const MSG = {
+  ROOM_NAME_INVALID: 'ชื่อห้อง 1–20 ตัวอักษร', PASSWORD_INVALID: 'รหัสผ่านต้องเป็นตัวเลข 4 หลัก', BAD_PASSWORD: 'รหัสผ่านไม่ถูกต้อง',
   ROOM_FULL: 'ห้องนี้เต็มหรือเริ่มเกมแล้ว', NAME_INVALID: 'กรุณาใส่ชื่อ 1–16 ตัวอักษร', BAD_PHASE: 'ทำแบบนี้ตอนนี้ไม่ได้',
   ALREADY_PLACED: 'ยืนยันการวางไปแล้ว', PLACEMENT_INVALID: 'การวางไม่ถูกต้อง', NOT_YOUR_TURN: 'ยังยิงไม่ได้ตอนนี้',
   OUT_OF_BOUNDS: 'พิกัดอยู่นอกกระดาน', ALREADY_SHOT: 'ช่องนี้ถูกยิงแล้ว', STALE_TURN: 'ตานี้ผ่านไปแล้ว',
@@ -123,6 +126,7 @@ class Room {
     this.players = []; this.joinSeq = 0;
     this.hostPid = null;
     this.settings = { mode: 'classic', bonusOnHit: true, islands: 'off', traps: false }; // R-5-01
+    this.meta = { name: '', private: false, password: null };                          // R-5-09, R-5-10
     this.phase = 'LOBBY'; this.gameNo = 0;
     this.turnStyle = null; this.boardSize = null; this.fleet = [];
     this.turnPid = null; this.turnNo = 0; this.roundNo = 0; this.deadline = null;
@@ -377,6 +381,7 @@ class Room {
     }
     switch (msg.type) {
       case 'update_settings': return this._settings(s, msg.settings);
+      case 'room_meta': return this._meta(s, msg.meta);
       case 'start_game': return this._start(s);
       case 'suggest_placement': return this._suggest(s);
       case 'submit_placement': return this._submit(s, msg.placement, msg.islands);
@@ -388,6 +393,49 @@ class Room {
       default: throw err('BAD_REQUEST');
     }
   }
+  // [ใหม่ v2.3] R-5-09 / R-5-10 ชื่อห้อง + สาธารณะ/ส่วนตัว + รหัสผ่าน
+  setMeta(v) {
+    if (!v || typeof v !== 'object') throw err('BAD_REQUEST');
+    const n = { ...this.meta };
+    if ('name' in v) {
+      if (typeof v.name !== 'string') throw err('ROOM_NAME_INVALID');
+      const name = v.name.trim().replace(/\s+/g, ' ');
+      if (!name || [...name].length > this.C.ROOM_NAME_MAX) throw err('ROOM_NAME_INVALID');
+      n.name = name;
+    }
+    if ('private' in v) { if (typeof v.private !== 'boolean') throw err('BAD_REQUEST'); n.private = v.private; }
+    if ('password' in v && v.password != null) {
+      if (typeof v.password !== 'string' || !this.C.ROOM_PASSWORD_RE.test(v.password)) throw err('PASSWORD_INVALID');
+      n.password = v.password;
+    }
+    if (n.private && !n.password) throw err('PASSWORD_INVALID');
+    if (!n.private) n.password = null;
+    this.meta = n;
+    this._log('room_meta', { name: n.name, private: n.private });
+    return {};
+  }
+  _meta(s, v) {
+    if (s.pid !== this.hostPid) throw err('NOT_HOST');
+    if (this.phase !== 'LOBBY' && this.phase !== 'GAME_OVER') throw err('BAD_PHASE');
+    return this.setMeta(v);
+  }
+  checkPassword(pw) { // R-5-11
+    if (!this.meta.private) return;
+    if (typeof pw !== 'string' || pw !== this.meta.password) throw err('BAD_PASSWORD');
+  }
+  // R-5-12 ข้อมูลห้องสำหรับรายการห้องหน้าแรก (ไม่มีรหัสผ่าน ไม่มี token)
+  summary() {
+    const act = this.active();
+    const host = this.seat(this.hostPid);
+    const full = act.length >= this.C.MAX_PLAYERS;
+    return {
+      code: this.code, name: this.meta.name, host: host ? host.name : '', private: this.meta.private,
+      players: act.length, max: this.C.MAX_PLAYERS,
+      status: this.phase === 'LOBBY' ? (full ? 'full' : 'open') : 'playing',
+      settings: { ...this.settings },
+    };
+  }
+  listed() { return this.active().some(p => p.connected); }
   _settings(s, v) { // R-5-05
     if (s.pid !== this.hostPid) throw err('NOT_HOST');
     if (this.phase !== 'LOBBY' && this.phase !== 'GAME_OVER') throw err('BAD_PHASE');
@@ -931,6 +979,7 @@ class Room {
     const C = this.C;
     return {
       code: this.code, phase: this.phase, gameNo: this.gameNo, you: pid, hostPid: this.hostPid,
+      room: { name: this.meta.name, private: this.meta.private, password: me ? this.meta.password : null }, // R-5-10 คนในห้องเห็นรหัสผ่าน
       settings: { ...this.settings }, turnStyle: this.turnStyle, boardSize: this.boardSize,
       fleet: this.fleet.map(f => f.id),
       turnPid: this.turnPid, turnNo: this.turnNo, roundNo: this.roundNo,
