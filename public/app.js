@@ -21,7 +21,7 @@
     ageOk: store.get('bw_age_ok') === true,                       // R-5-03
     session: ss.get('bw_session') || store.get('bw_session'),
     cat: new Map(), fit: {}, ver: '0',
-    fitKey: '', fitCs: 0, fitLock: false,                         // v2.5.1 ขนาดช่องที่คำนวณไว้แล้วของสภาพจอปัจจุบัน
+    fitKey: '', fitCs: 0, fitH: 0, fitLock: false, autoTabKey: null,                         // v2.5.1 ขนาดช่องที่คำนวณไว้แล้วของสภาพจอปัจจุบัน
     st: null, offset: 0, recvAt: 0,
     name: store.get('bw_name') || '',
     // v2.3 ห้องรอ: ลิงก์เชิญ ?room=1234&pw=0420 (R-5-14)
@@ -148,13 +148,18 @@
     const mine = st.phase === 'BATTLE' && m && m.alive && (st.turnStyle === 'turns' ? st.turnPid === m.pid : m.shooting && !m.submitted);
     const key = mine ? `${st.gameNo}:${st.turnStyle === 'turns' ? 'T' : st.roundNo}` : null;
     const cont = st.turnStyle === 'turns' && prev && prev.phase === 'BATTLE' && prev.turnPid === st.you; // ยิงต่อ ใช้ข้อความ "โดน! ยิงต่อได้อีกนัด" แทน
+    // [ใหม่ v2.6 R-10-15] ถึงตายิงใน Classic แล้วยังดูกระดานตัวเองอยู่ = สลับไปคู่แข่งให้ (ครั้งเดียวต่อตา สลับกลับมาเองได้)
+    if (mine && key !== S.autoTabKey && st.settings.mode === 'classic') {
+      S.autoTabKey = key;
+      if (!S.tab || S.tab === 'me') { const o = st.players.find(p => p.alive && !p.removed && p.pid !== st.you); if (o) S.tab = o.pid; }
+    }
     if (key && key !== S.turnKey && !cont && S.seen) { turnBanner(st.turnStyle === 'turns' ? ['ตาคุณ!', 'เลือกช่องแล้วกดยิง'] : ['ถึงเวลายิง!', 'เลือกเป้าแล้วกดส่ง'], (st.config && st.config.TURN_BANNER_MS) || 3000); SFX.play('turn'); }
     if (!mine) hideTurnBanner();
     if (st.turnStyle === 'turns') S.turnKey = mine ? key : null; else if (key) S.turnKey = key;
   }
   const STATE_SVG = {
-    miss: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.4" fill="#D5DED8" opacity=".85"/></svg>',
-    hit: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.2 5.4 5.6-2-2.4 5.3L23 12l-5.6 1.4 2.4 5.3-5.6-2L12 22l-2.2-5.3-5.6 2 2.4-5.3L1 12l5.6-1.3-2.4-5.3 5.6 2z" fill="#1A0E08" stroke="#F07A2A" stroke-width="1.6"/></svg>',
+    miss: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.4" fill="currentColor" opacity=".85"/></svg>',
+    hit: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.2 5.4 5.6-2-2.4 5.3L23 12l-5.6 1.4 2.4 5.3-5.6-2L12 22l-2.2-5.3-5.6 2 2.4-5.3L1 12l5.6-1.3-2.4-5.3 5.6 2z" fill="#1A0E08" stroke="currentColor" stroke-width="1.6"/></svg>',
     island: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21c0-5 .5-8 2-11" stroke="#7A5230" stroke-width="2" fill="none"/><path d="M14 10c-2-3-6-3-8-1 3-1 5 0 8 1zm0 0c1-3 5-5 8-3-3 0-5 1-8 3zm0 0c3-1 6 1 7 4-2-2-4-3-7-4z" fill="#2E9E4F"/><ellipse cx="12" cy="21.5" rx="7" ry="1.6" fill="#E9D79B"/></svg>',
     trap: '<svg class="mk" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18M5 19l2-9 3 5 2-8 2 8 3-5 2 9" fill="none" stroke="#C77DFF" stroke-width="2.2" stroke-linejoin="round"/><circle cx="12" cy="5" r="2" fill="#C77DFF"/></svg>',
   };
@@ -364,10 +369,13 @@
         if (o.traps && o.traps.has(k) && !st) { cls.push('s-trap', 'reveal'); inner = STATE_SVG.trap; }
         if (o.marks && o.marks.get(k)) cls.push(o.marks.get(k));
         const can = o.clickable && o.clickable(r, c, st);
-        const label = `${ROWL[r]}${c + 1} ${st ? LABEL[st] : ''}`;
-        const style = `grid-row:${r + 2};grid-column:${c + 2}`;
-        h += can ? `<button class="${cls.join(' ')}" style="${style}" data-act="${can}" data-r="${r}" data-c="${c}" data-k="${k}" aria-label="${label}">${inner}</button>`
-          : `<div class="${cls.join(' ')}" style="${style}" data-k="${k}" aria-label="${label}">${inner}</div>`;
+        const byPid = st && o.by && o.by.get(k);                       // [v2.6 R-7-15] สีของคนยิง
+        const sc = byPid && colorOf(byPid);
+        if (sc) cls.push('shotby');
+        const label = `${ROWL[r]}${c + 1} ${st ? LABEL[st] : ''}${sc ? ' โดย ' + ((pl(byPid) || {}).name || '') : ''}`;
+        const style = `grid-row:${r + 2};grid-column:${c + 2}${sc ? `;--sc:${sc}` : ''}`;
+        // [v2.6 R-10-16] ใช้ <button> เสมอ (เดิมสลับ div/button ทำให้ทุกช่องถูกสร้างใหม่ตอนเปลี่ยนตา = กระพริบ)
+        h += `<button class="${cls.join(' ')}" style="${style}" data-r="${r}" data-c="${c}" data-k="${k}"${can ? ` data-act="${can}"` : ' disabled'} aria-label="${label}">${inner}</button>`;
       }
     }
     h += `<div class="layer" style="left:var(--cs);top:var(--cs)">`;
@@ -419,6 +427,9 @@
     return { pieces, outlines, cells };
   }
   const cellsMap = board => { const b = S.st.boards.find(x => x.id === board); return new Map(b ? b.cells.map(([r, c, v]) => [kk(r, c), v]) : []); };
+  // [ใหม่ v2.6 R-7-15] ใครยิงช่องไหน -> ใช้ระบายสีของคนยิง
+  const shotByMap = board => { const b = S.st.boards.find(x => x.id === board); return new Map(b ? b.cells.filter(c => c[3]).map(([r, c, , by]) => [kk(r, c), by]) : []); };
+  const colorOf = pid => { const p = pl(pid); return p ? p.color : null; };
 
   // ---------- render ----------
   function render() {
@@ -433,11 +444,48 @@
     else html = ({ LOBBY: viewLobby, PLACING: viewPlacing, BATTLE: viewBattle, GAME_OVER: viewOver })[S.st.phase]();
     if (S.ageOk && !S.replaced) html = dockHTML(!!(S.st && S.session)) + html;   // v2.4 ปุ่มเสียง/แชท/เสียงสด
     if (S.modal) html += viewModal();
-    app.innerHTML = html;
+    paint(app, html);
     document.querySelectorAll('.bwrap').forEach((el, i) => { if (scroll[i]) { el.scrollLeft = scroll[i][0]; el.scrollTop = scroll[i][1]; } });
-    if (focusId) { const f = document.getElementById(focusId); if (f) { f.focus(); if (f.setSelectionRange) { const v = f.value; f.setSelectionRange(v.length, v.length); } } }
+    if (focusId && document.activeElement !== document.getElementById(focusId)) { const f = document.getElementById(focusId); if (f) { f.focus(); if (f.setSelectionRange) { const v = f.value; f.setSelectionRange(v.length, v.length); } } }
     updateTimer();
     fitScreen();
+  }
+
+
+  // [ใหม่ v2.6] R-10-16 แก้เฉพาะส่วนที่ต่าง ไม่แทนที่ DOM ทั้งหน้า
+  // เดิม app.innerHTML = html สร้างช่องกระดานและภาพชิ้นใหม่หมดทุกครั้ง (ยิง 1 ครั้ง = 3 รอบ) เห็นเป็นจอกระพริบบน Safari
+  // ที่นี่เทียบของเดิมกับของใหม่ แล้วแตะเฉพาะข้อความ/แอตทริบิวต์ที่เปลี่ยนจริง ปุ่มและ <img> ที่เหมือนเดิมไม่ถูกสร้างใหม่
+  function paint(root, html) {
+    if (!root.firstChild) { root.innerHTML = html; return; }
+    const tmp = document.createElement('div'); tmp.innerHTML = html;
+    patchKids(root, tmp);
+  }
+  function patchKids(oldP, newP) {
+    const o = oldP.childNodes, n = newP.childNodes;
+    for (let i = 0; i < n.length; i++) {
+      const nn = n[i], on = o[i];
+      if (!on) { oldP.appendChild(nn.cloneNode(true)); continue; }
+      if (!patchNode(on, nn)) oldP.replaceChild(nn.cloneNode(true), on);
+    }
+    while (o.length > n.length) oldP.removeChild(oldP.lastChild);
+  }
+  function patchNode(on, nn) {
+    if (on.nodeType !== nn.nodeType) return false;
+    if (on.nodeType === 3 || on.nodeType === 8) { if (on.nodeValue !== nn.nodeValue) on.nodeValue = nn.nodeValue; return true; }
+    if (on.nodeType !== 1 || on.tagName !== nn.tagName) return false;
+    const typing = on === document.activeElement && (on.tagName === 'INPUT' || on.tagName === 'TEXTAREA');
+    for (const a of nn.attributes) {                       // ใส่/แก้เฉพาะที่ค่าต่าง
+      if (typing && a.name === 'value') continue;
+      if (on.getAttribute(a.name) !== a.value) on.setAttribute(a.name, a.value);
+    }
+    for (let i = on.attributes.length - 1; i >= 0; i--) {  // ลบอันที่หายไป
+      const a = on.attributes[i];
+      if (!nn.hasAttribute(a.name)) on.removeAttribute(a.name);
+    }
+    if (on.tagName === 'INPUT' && !typing && on.value !== (nn.getAttribute('value') || '')) on.value = nn.getAttribute('value') || '';
+    if (on.tagName === 'IMG' || on.tagName === 'svg') { if (on.innerHTML !== nn.innerHTML) on.innerHTML = nn.innerHTML; return true; }
+    patchKids(on, nn);
+    return true;
   }
 
   // [ใหม่ v2.5] R-10-13 พอดีจอ: ช่วงวางชิ้น/ยิง ย่อช่องกระดานให้ทั้งหน้าอยู่ในจอเดียว ถ้าพอดีแล้วล็อกไม่ให้เลื่อนหน้า
@@ -447,6 +495,15 @@
   // render รอบถัดไปใช้ค่าที่จำไว้เลย ไม่วัดใหม่ ไม่ปลด/ใส่ noscroll สลับไปมา = กระดานไม่กระตุกทุกครั้งที่กดปุ่ม
   const fitKey = () => `${S.st && S.st.phase}|${S.st ? B() : 0}|${window.innerWidth}|${S.zoom}`;
   const isTyping = () => { const a = document.activeElement; return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
+  function shrink(board, need, avail) {
+    const n = B() + 1;
+    for (let i = 0; i < 8 && need() > avail; i++) {   // v2.5.1 วัดรอบเดียวจึงต้องลองให้ครบ (เดิมอาศัยว่า render ทุกครั้งเรียกซ้ำ)
+      const cur = parseFloat(board.style.getPropertyValue('--cs'));
+      const next = Math.max(FIT_MIN_CS, Math.floor(cur - (need() - avail) / n) - 1);
+      if (next >= cur) break;
+      board.style.setProperty('--cs', next + 'px');
+    }
+  }
   function fitScreen() {
     const root = document.documentElement, app = $('#app');
     const on = !!(app && S.st && S.session && (S.st.phase === 'PLACING' || S.st.phase === 'BATTLE') && S.zoom === 1);
@@ -458,16 +515,15 @@
     const avail = Math.floor(window.innerHeight);   // ไม่ใช้ visualViewport: ค่ามันหดตอนแป้นพิมพ์เด้ง
     const need = () => Math.ceil(app.getBoundingClientRect().height + pad);
     // สภาพจอเดิม = ไม่วัด/ไม่ย่อกระดานใหม่ (กันกระตุก) แต่ยังเช็กว่าควรล็อกเลื่อนไหม เผื่อเนื้อหาในหน้ายาวขึ้น เช่น มีข้อความแจ้งเพิ่ม
-    if (key === S.fitKey && S.fitCs) { S.fitLock = need() <= avail; root.classList.toggle('noscroll', S.fitLock); return; }
-    board.style.setProperty('--cs', board.dataset.cs + 'px');
-    const n = B() + 1;
-    for (let i = 0; i < 8 && need() > avail; i++) {   // v2.5.1 วัดรอบเดียวจึงต้องลองให้ครบ (เดิมอาศัยว่า render ทุกครั้งเรียกซ้ำ)
-      const cur = parseFloat(board.style.getPropertyValue('--cs'));
-      const next = Math.max(FIT_MIN_CS, Math.floor(cur - (need() - avail) / n) - 1);
-      if (next >= cur) break;
-      board.style.setProperty('--cs', next + 'px');
+    if (key === S.fitKey && S.fitCs) {
+      // [v2.6] สภาพจอเดิม: ย่อเพิ่มได้ถ้าเนื้อหายาวขึ้นภายหลัง แต่ไม่ขยายกลับ (ย่ออย่างเดียว = ไม่กระตุกไปมา)
+      // ย่อเพิ่มเฉพาะกรณี "เนื้อหายาวขึ้นเอง" เท่านั้น · ถ้าจอเตี้ยลง (แป้นพิมพ์/แถบ Safari) ไม่แตะกระดาน ปล่อยให้เลื่อนแทน
+      if (!isTyping() && avail >= (S.fitH || 0) - 8 && need() > avail && S.fitCs > FIT_MIN_CS) { shrink(board, need, avail); S.fitCs = parseFloat(board.style.getPropertyValue('--cs')); }
+      S.fitLock = need() <= avail; root.classList.toggle('noscroll', S.fitLock); return;
     }
-    S.fitKey = key; S.fitCs = parseFloat(board.style.getPropertyValue('--cs')); S.fitLock = need() <= avail;
+    board.style.setProperty('--cs', board.dataset.cs + 'px');
+    shrink(board, need, avail);
+    S.fitKey = key; S.fitCs = parseFloat(board.style.getPropertyValue('--cs')); S.fitH = avail; S.fitLock = need() <= avail;
     root.classList.toggle('noscroll', !!S.fitLock);
   }
   // คำนวณใหม่เฉพาะตอนหมุนจอ หรือความกว้างจอเปลี่ยน (แถบที่อยู่ Safari ยืดหด = ความสูงเปลี่ยนอย่างเดียว ไม่คำนวณใหม่)
@@ -526,6 +582,7 @@
     return `<div class="rcard ${rm.status}"><div class="rinfo"><div class="rname">${rm.private ? '🔒 ' : ''}${esc(rm.name)}</div>
       <div class="muted small">โดย ${esc(rm.host)} · #${esc(rm.code)}</div><div class="tags">${roomTags(rm)}</div></div>${st}</div>`;
   }
+  const APP_V = (document.querySelector('meta[name=bw-version]') || {}).content || '';   // [v2.6 R-10-14] เลขรุ่นที่เครื่องนี้โหลดมาจริง
   function viewHome() {
     ensureList(); lookInvite();
     const iv = S.invite; const nr = S.newRoom;
@@ -547,7 +604,8 @@
       ${iv.code && iv.room ? `<section class="panel invite"><h2>คำเชิญเข้าห้อง</h2>${roomCard(iv.room, iv.pw)}</section>` : ''}
       ${create}
       <section class="panel"><h2>ห้องที่เปิดอยู่ <span class="muted small">(${S.rooms.filter(r => r.status === 'open').length} ห้องรอคน)</span></h2><div class="rlist">${list}</div></section>
-      ${standalone() ? '' : '<button class="btn ghost install-btn" data-act="install">📲 เพิ่มไปหน้าจอโฮม</button>'}`;
+      ${standalone() ? '' : '<button class="btn ghost install-btn" data-act="install">📲 เพิ่มไปหน้าจอโฮม</button>'}
+      <p class="muted small center vtag">รุ่น ${esc(APP_V || '—')}</p>`;
   }
   async function joinRoom(code, pw, el) {
     const name = (($('#in-name') || {}).value || S.name || '').trim();
@@ -668,6 +726,7 @@
         if (S.st.turnStyle === 'rounds' && p.submitted) tags.push('<span class="tag ok">ส่งแล้ว</span>');
         if (S.st.turnStyle === 'turns' && p.pid === S.st.turnPid) tags.push('<span class="tag turn">กำลังยิง</span>');
       }
+      if (!tags.length) tags.push('<span class="tag inv">—</span>');   // [v2.6 R-10-17] จองที่ป้ายไว้ ไม่ให้แถวสูงไม่เท่ากันแล้วดันทั้งหน้า
       return `<tr class="${p.alive ? '' : 'dead'}"><th>${dot(p)}${esc(p.name)}${p.pid === S.st.you ? ' (คุณ)' : ''} ${tags.join('')}</th>
         ${fleet.map(id => `<td class="${sunk.has(id) ? 'gone' : ''}">${sunk.has(id) ? '✕' : '●'}</td>`).join('')}</tr>`;
     }).join('');
@@ -701,27 +760,29 @@
       const tabs = [...opps, m].map(p => `<button class="tab ${S.tab === (p.pid === m.pid ? 'me' : p.pid) ? 'on' : ''}" data-act="tab" data-id="${p.pid === m.pid ? 'me' : esc(p.pid)}" style="--pc:${p.color}">${dot(p)}${p.pid === m.pid ? 'ของคุณ' : esc(p.name)}</button>`).join('');
       if (S.tab === 'me') {
         const sl = sunkLayers([m]); const ol = ownLayers(m, m.placement);
-        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: m.pid, cells: cellsMap(m.pid), islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
+        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: m.pid, cells: cellsMap(m.pid), by: shotByMap(m.pid), islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
           pieces: [...ol.pieces, ...sl.pieces], outlines: [...ol.outlines, ...sl.outlines], ownCells: ol.ownCells, sunkCells: sl.cells })}`;
       } else {
         const o = pl(S.tab); const sl = sunkLayers([o]);
-        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: o.pid, cells: cellsMap(o.pid), marks, pieces: sl.pieces, outlines: sl.outlines, sunkCells: sl.cells,
+        boardBlock = `<div class="tabs">${tabs}</div>${boardHTML({ board: o.pid, cells: cellsMap(o.pid), by: shotByMap(o.pid), marks, pieces: sl.pieces, outlines: sl.outlines, sunkCells: sl.cells,
           clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) })}`;
       }
     } else {
       const sl = sunkLayers(st.players); const ol = ownLayers(m, m.placement);
-      boardBlock = boardHTML({ board: '*', cells: cellsMap('*'), marks, islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
+      boardBlock = boardHTML({ board: '*', cells: cellsMap('*'), by: shotByMap('*'), marks, islands: new Set((m.islands || []).flat().map(([r, c]) => kk(r, c))),
         pieces: [...ol.pieces, ...sl.pieces], outlines: [...ol.outlines, ...sl.outlines], ownCells: ol.ownCells, sunkCells: sl.cells,
         clickable: (r, c, s) => (myTurn && !s ? 'aim' : null) });
     }
     const n = needShots();
-    const dblCtl = myTurn && m.doubleBonus ? `<div class="row"><span class="muted">นัดคู่แนว</span><button class="btn ghost small ${S.dbl === 'H' ? 'on' : ''}" data-act="dbl" data-v="H">นอน ↔</button><button class="btn ghost small ${S.dbl === 'V' ? 'on' : ''}" data-act="dbl" data-v="V">ตั้ง ↕</button></div>` : '';
-    // R-10-06 ปุ่มยิงติดขอบล่างจอ
-    const fireBtn = myTurn ? `<div class="firebar">${dblCtl}<button class="btn fire" data-act="fire" ${S.aim.length === n ? '' : 'disabled'}>ยิง! (${S.aim.length}/${n})</button>
-      <div class="muted center small">${S.aim.length ? 'ไม่กดยิงจนหมดเวลา = ยิงช่องที่เลือกไว้' : 'แตะช่องบนกระดานเพื่อเล็ง'}</div></div>` : '';
+    // [v2.6 R-10-17] ล็อกผัง: ปุ่มยิงและบรรทัดคำแนะนำอยู่ที่เดิมเสมอ ถึงยังไม่ถึงตาก็จองที่ไว้ (ไม่ให้ของทั้งหน้าขยับ)
+    const dblOn = myTurn && m.doubleBonus;
+    const hint = !myTurn ? '' : S.aim.length ? 'ไม่กดยิงจนหมดเวลา = ยิงช่องที่เลือกไว้' : 'แตะช่องบนกระดานเพื่อเล็ง';
+    const fireBtn = `<div class="firebar">
+      <button class="btn fire${myTurn ? '' : ' inv'}" data-act="fire" ${myTurn && S.aim.length === n ? '' : 'disabled'}>ยิง! (${myTurn ? S.aim.length : 0}/${n})</button>
+      <div class="fhint"><span class="muted small">${hint}</span><span class="dblctl${dblOn ? '' : ' inv'}"><span class="muted small">นัดคู่แนว</span><button class="btn ghost small ${S.dbl === 'H' ? 'on' : ''}" data-act="dbl" data-v="H" ${dblOn ? '' : 'disabled'}>นอน ↔</button><button class="btn ghost small ${S.dbl === 'V' ? 'on' : ''}" data-act="dbl" data-v="V" ${dblOn ? '' : 'disabled'}>ตั้ง ↕</button></span></div></div>`;
+    const warn2 = m.autoStreak && m.alive ? `ระบบยิงแทนคุณ ${m.autoStreak} ครั้งติดกันแล้ว ครบ 3 ครั้งจะตกรอบ` : '';
     return `${header(timerHTML())}
-      <div class="status"><span>${status}</span><span class="zoomctl"><button class="btn ghost small" data-act="zoom" data-v="-1" aria-label="ย่อ">−</button><button class="btn ghost small" data-act="zoom" data-v="1" aria-label="ขยาย">+</button></span></div>
-      ${m.autoStreak && m.alive ? `<div class="warn">ระบบยิงแทนคุณ ${m.autoStreak} ครั้งติดกันแล้ว ครบ 3 ครั้งจะตกรอบ</div>` : ''}
+      <div class="status lock2"><div class="srow"><span>${status}</span><span class="zoomctl"><button class="btn ghost small" data-act="zoom" data-v="-1" aria-label="ย่อ">−</button><button class="btn ghost small" data-act="zoom" data-v="1" aria-label="ขยาย">+</button></span></div><div class="srow2${warn2 ? ' on' : ''}">${warn2}</div></div>
       ${warnHTML()}${summaryHTML()}
       ${boardBlock}
       ${fireBtn}
@@ -753,11 +814,11 @@
       const o = pl(S.tab);
       const bd = S.st.boards.find(b => b.id === o.pid);
       boards = `<div class="tabs">${all.map(p => `<button class="tab ${S.tab === p.pid ? 'on' : ''}" data-act="tab" data-id="${esc(p.pid)}">${dot(p)}${esc(p.name)}</button>`).join('')}</div>
-        ${boardHTML({ board: o.pid, cells: cellsMap(o.pid), islands: new Set((o.islands || []).flat().map(([r, c]) => kk(r, c))), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
+        ${boardHTML({ board: o.pid, cells: cellsMap(o.pid), by: shotByMap(o.pid), islands: new Set((o.islands || []).flat().map(([r, c]) => kk(r, c))), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
           pieces: imgsOf(o), outlines: outlinesOf(o), sunkCells: sunkSet([o]) })}`;
     } else {
       const bd = S.st.boards.find(b => b.id === '*');
-      boards = boardHTML({ board: '*', cells: cellsMap('*'), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
+      boards = boardHTML({ board: '*', cells: cellsMap('*'), by: shotByMap('*'), traps: new Set(((bd && bd.traps) || []).map(([r, c]) => kk(r, c))),
         islands: new Set(all.flatMap(p => (p.islands || []).flat().map(([r, c]) => kk(r, c)))), pieces: all.flatMap(imgsOf), outlines: all.flatMap(outlinesOf), sunkCells: sunkSet(all) });
     }
     const act2 = S.st.players.filter(p => !p.removed);

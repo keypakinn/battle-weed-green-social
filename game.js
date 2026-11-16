@@ -547,7 +547,7 @@ class Room {
   _beginBattle() {
     this.phase = 'BATTLE';
     const B = this.boardSize;
-    for (const id of this._boardIds()) this.boards.set(id, { shot: new Map(), traps: new Set(), trapsHit: new Set() });
+    for (const id of this._boardIds()) this.boards.set(id, { shot: new Map(), shotBy: new Map(), traps: new Set(), trapsHit: new Set() });
     if (this.settings.traps) { // R-7-60
       const nTrap = Math.max(1, Math.round(this.C.TRAP_RATE * B * B));
       for (const [id, bd] of this.boards) {
@@ -607,6 +607,7 @@ class Room {
       else if (occ.islands.length) pub = 'island';
       else pub = 'miss';
       bd.shot.set(k, pub);
+      bd.shotBy.set(k, shots[idxs[0]].shooter);   // [ใหม่ v2.6 R-7-15] จำคนยิง (หลายคนยิงช่องเดียวกัน = คนแรกตามลำดับที่ประมวลผล)
       occ.pieces.forEach(x => hitPieces.push(x));
       occ.islands.forEach(x => touchedIslands.push({ ...x, board }));
       // แจ้งเตือนส่วนตัว R-4-04
@@ -1017,7 +1018,7 @@ class Room {
     const boards = [];
     for (const [id, bd] of this.boards) {
       boards.push({
-        id, cells: [...bd.shot.entries()].map(([k, v]) => [...this._rc(k), v]),
+        id, cells: [...bd.shot.entries()].map(([k, v]) => [...this._rc(k), v, bd.shotBy.get(k) || null]),   // v2.6: เพิ่ม pid คนยิง
         traps: reveal ? [...bd.traps].map(k => this._rc(k)) : undefined,
       });
     }

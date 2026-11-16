@@ -202,3 +202,21 @@ button.cell:active{filter:brightness(1.3)}
 /* [ใหม่ v2.5] R-10-13 หน้าเกมที่พอดีจอ = ไม่เลื่อนทั้งหน้า (ใช้ความสูงจริงที่ไม่รวมแถบ Safari) */
 html.noscroll,html.noscroll body{height:100dvh;overflow:hidden}
 @media (max-height:720px){.legend .howto{display:none}}
+
+/* [ใหม่ v2.6] R-10-17 ล็อกผังหน้าเล่น: ทุกส่วนจองที่ไว้เท่าเดิม ไม่ว่าถึงตาใคร */
+.status.lock2{display:block;padding:8px 12px}
+.status.lock2 .srow{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:30px}
+.status.lock2 .srow2{min-height:20px;font-size:13px;line-height:20px;color:transparent}
+.status.lock2 .srow2.on{color:#FFD9A8}
+.fhint{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:30px}
+.fhint .dblctl{display:flex;align-items:center;gap:6px}
+.inv{visibility:hidden}
+/* [ใหม่ v2.6] R-7-15 ช่องที่ถูกยิงติดสีของคนยิง */
+.cell.shotby::after{content:'';position:absolute;inset:0;background:var(--sc);opacity:.17;pointer-events:none}
+.cell.s-hit.shotby::after,.cell.s-island_hit.shotby::after{opacity:.32}
+.cell.s-miss{color:#D5DED8}
+.cell.s-hit,.cell.s-island_hit{color:#F07A2A}
+.cell.s-miss.shotby,.cell.s-hit.shotby,.cell.s-island_hit.shotby{color:var(--sc)}
+.cell .mk{position:relative;z-index:1}
+.vtag{opacity:.55;margin-top:14px}
+@media (max-height:760px){.legend{display:none}.fhint{min-height:0}.fhint .muted{display:none}.status.lock2 .srow2{min-height:0;font-size:12px;line-height:16px}}

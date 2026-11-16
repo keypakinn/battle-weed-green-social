@@ -754,6 +754,37 @@ test('T-70 getState: voice มีแค่ pid · ไม่มี token/รห�
   assert.ok(st.config.COUNTDOWN_FROM === 5 && st.config.CHAT_MAX === 100);
 });
 
+test('T-78 [v2.6] state ส่ง pid คนยิงมากับทุกช่องที่ถูกยิง · หลายคนยิงช่องเดียวกัน = คนแรก · ยิงแทนอัตโนมัติก็บันทึกเป็นคนนั้น [R-7-15]', () => {
+  const by = (x, board, r, c) => { const b = x.room.getState(x.P[0]).boards.find(b => b.id === board); const e = b.cells.find(([y, z]) => y === r && z === c); return e && e[3]; };
+  // turns: 2 คน ผลัดกันยิง
+  const t2 = start(2, { mode: 'survival' }, 3);
+  const first = t2.room.turnPid;
+  fire(t2, first, [shot(0, 0)]);
+  assert.strictEqual(by(t2, '*', 0, 0), first, 'ช่องแรกต้องเป็นของคนที่ยิง');
+  assert.strictEqual(typeof by(t2, '*', 0, 0), 'string');
+  let col = 1;
+  while (t2.room.turnPid === first && col < 12) fire(t2, first, [shot(0, col++)]);   // ยิงโดน = ได้ยิงต่อ ยิงจนกว่าจะเปลี่ยนมือ
+  const other = t2.room.turnPid;
+  assert.notStrictEqual(other, first, 'ตาต้องเปลี่ยนมือ');
+  fire(t2, other, [shot(1, 0)]);
+  assert.strictEqual(by(t2, '*', 1, 0), other);
+  assert.notStrictEqual(by(t2, '*', 0, 0), by(t2, '*', 1, 0), 'คนละคนต้องได้คนละ pid');
+  // rounds: 3 คนยิงช่องเดียวกันในรอบเดียว = คนแรกตามลำดับที่ประมวลผล
+  const t3 = start(3, { mode: 'survival' }, 4);
+  const live = t3.room.getState(t3.P[0]).players.filter(p => p.shooting).map(p => p.pid);
+  live.forEach(pid => fire(t3, pid, [shot(5, 5)]));
+  const w = by(t3, '*', 5, 5);
+  assert.ok(live.includes(w), 'ต้องเป็นหนึ่งในคนที่ยิง');
+  assert.strictEqual(w, live[0], 'คนแรกตามลำดับที่ประมวลผล');
+  // ยิงแทนอัตโนมัติ: ปล่อยหมดเวลา
+  const t4 = start(2, { mode: 'survival' }, 5);
+  const who = t4.room.turnPid;
+  T += 20001; t4.room.tick();   // ปล่อยจนหมดเวลา = ระบบยิงแทน
+  const st = t4.room.getState(t4.P[0]).boards.find(b => b.id === '*');
+  assert.ok(st.cells.length >= 1, 'ต้องมีช่องที่ถูกยิงแทน');
+  assert.ok(st.cells.every(c => c.length === 4), 'ทุกช่องต้องมี 4 ค่า');
+  assert.strictEqual(st.cells[0][3], who, 'ยิงแทนต้องบันทึกเป็นคนที่ถึงตา');
+});
 test('T-75 getState ส่งค่าแบนเนอร์ตาเล่นให้ client (3000 ms) และ config ใหม่ผ่านการตรวจ [R-10-12]', () => {
   const x = mk(2, {});
   assert.strictEqual(x.room.getState(x.P[0]).config.TURN_BANNER_MS, 3000);

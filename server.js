@@ -1,5 +1,6 @@
 'use strict';
 const path = require('path');
+const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
@@ -24,7 +25,11 @@ app.get('/healthz', (req, res) => res.type('text').send('ok'));
 app.get('/api/cards', (req, res) => res.json({ version: CARDS.version, cards: CARDS.cards, fit: CARDS.fit }));
 app.use('/cards', express.static(CARDS_DIR, { maxAge: '30d' }));
 app.use('/shared', express.static(path.join(__dirname, 'shared')));
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
+// [ใหม่ v2.6 R-10-14] หน้าแรกแทรกเลขรุ่นให้ไฟล์ย่อย (กันเบราว์เซอร์ใช้โค้ดเก่าค้างหลัง deploy)
+const VERSION = require('./package.json').version;
+const INDEX = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8').replace(/__V__/g, VERSION);
+app.get(['/', '/index.html'], (req, res) => { res.set('Cache-Control', 'no-cache'); res.type('html').send(INDEX); });
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0, index: false }));
 
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 1e5 });
