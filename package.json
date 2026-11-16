@@ -1,6 +1,6 @@
 {
   "name": "battle-weed-green-social",
-  "version": "2.3.0",
+  "version": "2.5.0",
   "description": "Battle Weed: Green Social — เกมยิงช่องออนไลน์ 2 คน (ชุด 420)",
   "main": "server.js",
   "private": true,

@@ -1,4 +1,4 @@
-/* Battle Weed: Green Social v2.3 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
+/* Battle Weed: Green Social v2.4 — หน้าเว็บ (render ทั้งหน้าจาก state เดียว) */
 (function () {
   'use strict';
   const $ = s => document.querySelector(s);
@@ -32,6 +32,7 @@
     aim: [], dbl: 'H', tab: null, zoom: 1, sumOpen: false,
     // แอนิเมชัน
     anim: new Map(), reveal: new Map(), lastResolveKey: null, seen: false,
+    chat: { open: false, log: [], unread: 0, hidden: new Set(), lastNote: 0 }, sheet: null, // v2.4 แชท / เสียงสด
     modal: null, replaced: false, lost: null, installEvt: null, notes: [], turnKey: null, restoreAim: true,
   };
   let reqSeq = 0;
@@ -55,7 +56,7 @@
     for (const c of d.cards) S.cat.set(c.id, { ...c, cells: parseShape(c.shape) });
     render();
   }).catch(() => toast('โหลดข้อมูลชิ้นไม่ได้'));
-  const artURL = id => `/cards/art/${id}.webp?v=${S.ver}`;
+  const artURL = id => `/cards/art/${(S.fit[id] && S.fit[id].art) || id}.webp?v=${S.ver}`; // R-4.1-07 fit.art = ไฟล์ภาพที่ใช้แทน id
   const absCells = p => rotateCells(piece(p.pieceId).cells, p.rot).map(([r, c]) => [r + p.row, c + p.col]);
 
   // ---------- socket ----------
@@ -75,16 +76,25 @@
     if (st.phase === 'BATTLE' && !S.tab) S.tab = null;
     onResolve(st, prev);
     turnAlert(st, prev);
+    stateSounds(st, prev);
+    try { VOICE.setSelf(st.you); VOICE.sync(st); } catch (e) { /* */ }
     S.seen = true;
     render();
+    refreshSheet();
   });
-  socket.on('notice', list => { for (const n of list) { if (/^big_/.test(n.kind)) bigAlert(n.text); else note(n.text, n.kind); } });
+  socket.on('chat', m => addChat(m, true));
+  socket.on('chat_log', list => { S.chat.log = []; S.chat.unread = 0; for (const m of list || []) addChat(m, false); refreshSheet(); });
+  socket.on('notice', list => { for (const n of list) {
+    if (/^big_/.test(n.kind)) bigAlert(n.text); else note(n.text, n.kind);
+    if (n.kind === 'big_again' || n.kind === 'big_two') SFX.play('power');   // R-10-09 ได้ยิงเพิ่ม
+    if (n.kind === 'elim' && S.st && n.pid === S.st.you) SFX.play('elim');
+  } });
   function resume() {
     socket.emit('resume', { code: S.session.code, token: S.session.token }, r => {
       if (!r || !r.ok) { S.lost = r && r.error ? r.error : 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่'; dropSession(); }
     });
   }
-  function dropSession() { S.session = null; S.st = null; ss.del('bw_session'); store.del('bw_session'); render(); }
+  function dropSession() { S.session = null; S.st = null; try { VOICE.reset(); } catch (e) { /* */ } S.sheet = null; S.chat.log = []; S.chat.unread = 0; try { SFX.bgm(null); } catch (e) { /* */ } renderSheet(); ss.del('bw_session'); store.del('bw_session'); render(); }
   function emit(ev, payload) {
     return new Promise(res => socket.emit(ev, payload, r => {
       if (!r || !r.ok) {
@@ -123,12 +133,22 @@
     else { el.innerHTML = `<div>${esc(text)}</div>`; el.classList.remove('show'); void el.offsetWidth; el.classList.add('show'); bigAlert.at = t; }
     clearTimeout(bigAlert.tm); bigAlert.tm = setTimeout(() => el.classList.remove('show'), 1700);
   }
+  // [ใหม่ v2.5] R-10-12 แบนเนอร์ใหญ่เมื่อถึงตา: แสดง TURN_BANNER_MS แล้วหายเอง · แตะที่ไหนก็ได้ = หายทันที (การแตะยังทำงานตามปกติ ไม่ถูกกลืน)
+  function hideTurnBanner() { const el = $('#turnbanner'); if (!el) return; clearTimeout(turnBanner.tm); el.hidden = true; el.classList.remove('show'); }
+  function turnBanner([title, sub], ms) {
+    const el = $('#turnbanner'); if (!el) return;
+    el.innerHTML = `<b>${esc(title)}</b><span>${esc(sub)}</span>`;
+    el.hidden = false; el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+    clearTimeout(turnBanner.tm); turnBanner.tm = setTimeout(hideTurnBanner, ms);
+  }
+  document.addEventListener('pointerdown', () => { const el = $('#turnbanner'); if (el && !el.hidden) hideTurnBanner(); }, { capture: true, passive: true });
   function turnAlert(st, prev) {
     const m = st.players.find(p => p.pid === st.you);
     const mine = st.phase === 'BATTLE' && m && m.alive && (st.turnStyle === 'turns' ? st.turnPid === m.pid : m.shooting && !m.submitted);
     const key = mine ? `${st.gameNo}:${st.turnStyle === 'turns' ? 'T' : st.roundNo}` : null;
     const cont = st.turnStyle === 'turns' && prev && prev.phase === 'BATTLE' && prev.turnPid === st.you; // ยิงต่อ ใช้ข้อความ "โดน! ยิงต่อได้อีกนัด" แทน
-    if (key && key !== S.turnKey && !cont && S.seen) bigAlert('ตาคุณ!');
+    if (key && key !== S.turnKey && !cont && S.seen) { turnBanner(st.turnStyle === 'turns' ? ['ตาคุณ!', 'เลือกช่องแล้วกดยิง'] : ['ถึงเวลายิง!', 'เลือกเป้าแล้วกดส่ง'], (st.config && st.config.TURN_BANNER_MS) || 3000); SFX.play('turn'); }
+    if (!mine) hideTurnBanner();
     if (st.turnStyle === 'turns') S.turnKey = mine ? key : null; else if (key) S.turnKey = key;
   }
   const STATE_SVG = {
@@ -153,6 +173,20 @@
     }
     for (const s of st.lastSunk || []) S.reveal.set(`${s.ownerPid}:${s.pieceId}`, t0 + C.ANIM_BULLET_MS + C.SUNK_REVEAL_MS);
     requestAnimationFrame(flyBullets);
+    const kinds = new Set(); for (const sh of st.lastResolve || []) for (const c of sh.cells) kinds.add(c[2]);
+    const sig = st.gameNo + '|' + JSON.stringify(st.lastResolve || []);
+    if (kinds.size && sig !== S.lastShotSig) {                      // มีนัดยิงใหม่จริง (ไม่เล่นซ้ำเมื่อ state เปลี่ยนแต่ผลยิงเดิม)
+    S.lastShotSig = sig;
+    SFX.play('launch');                                              // R-10-09 กระสุนลอย แล้วเสียงผลตอนกระสุนตก
+    const sunkNow = (st.lastSunk || []).length > 0;
+    setTimeout(() => {
+      if (sunkNow) SFX.play('sunk');
+      else if (kinds.has('hit') || kinds.has('island_hit')) SFX.play('hit');
+      if (kinds.has('trap')) SFX.play('trap');
+      if (kinds.has('island') || kinds.has('island_hit')) SFX.play('island');
+      if (kinds.has('miss') && !kinds.has('hit') && !kinds.has('island_hit') && !sunkNow) SFX.play('miss');
+    }, C.ANIM_BULLET_MS);
+    }
     const total = C.ANIM_BULLET_MS + Math.max(C.ANIM_EFFECT_MS, C.SUNK_REVEAL_MS) + 50;
     setTimeout(render, C.ANIM_BULLET_MS + 20); setTimeout(() => { cleanupAnim(); render(); }, total);
   }
@@ -206,14 +240,14 @@
     if (here) { S.sel = S.sel === here ? null : here; return render(); }       // แตะชิ้น = เลือก / แตะซ้ำ = เลิกเลือก
     if (S.sel) {                                                               // ย้ายชิ้นที่เลือกไปช่องที่แตะ
       const v = S.draft[S.sel]; const bad = fits(S.sel, r, c, v.rot);
-      if (bad) return toast(whyText(bad));
-      S.draft[S.sel] = { ...v, row: r, col: c }; return render();
+      if (bad) { SFX.play('invalid'); return toast(whyText(bad)); }
+      S.draft[S.sel] = { ...v, row: r, col: c }; SFX.play('place'); return render();
     }
     const id = S.pick && !S.draft[S.pick] ? S.pick : nextUnplaced();
     if (!id) return toast('วางครบแล้ว แตะชิ้นบนกระดานเพื่อย้าย หมุน หรือเอาออก');
     const bad = fits(id, r, c, 0);
-    if (bad) return toast(whyText(bad));
-    S.draft[id] = { row: r, col: c, rot: 0 };
+    if (bad) { SFX.play('invalid'); return toast(whyText(bad)); }
+    S.draft[id] = { row: r, col: c, rot: 0 }; SFX.play('place');
     S.pick = nextUnplaced();
     render();
   }
@@ -224,8 +258,8 @@
     const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
     const row = Math.max(0, Math.min(v.row, B() - h)), col = Math.max(0, Math.min(v.col, B() - w)); // หมุนแล้วล้น = ขยับเข้ามาในกระดาน
     const bad = fits(id, row, col, rot);
-    if (bad) return toast(whyText(bad));
-    S.draft[id] = { row, col, rot }; render();
+    if (bad) { SFX.play('invalid'); return toast(whyText(bad)); }
+    S.draft[id] = { row, col, rot }; SFX.play('rotate'); render();
   }
   function removeSel() { if (!S.sel) return; delete S.draft[S.sel]; S.pick = S.sel; S.sel = null; render(); }
 
@@ -269,8 +303,8 @@
     clearTimeout(d.timer); S.drag = null;
     if (!d.active) return;
     S.dragEndAt = Date.now();
-    if (d.pos && !d.bad) S.draft[d.id] = { ...S.draft[d.id], row: d.pos.row, col: d.pos.col };
-    else if (d.bad) toast(whyText(d.bad));                                    // ปล่อยตรงที่วางไม่ได้ = กลับที่เดิม
+    if (d.pos && !d.bad) { S.draft[d.id] = { ...S.draft[d.id], row: d.pos.row, col: d.pos.col }; SFX.play('place'); }
+    else if (d.bad) { SFX.play('invalid'); toast(whyText(d.bad)); }                                    // ปล่อยตรงที่วางไม่ได้ = กลับที่เดิม
     render();
   }
   document.addEventListener('touchstart', e => { if (e.touches.length === 1) dragStart(e.touches[0].clientX, e.touches[0].clientY, e.target); else if (S.drag) { clearTimeout(S.drag.timer); S.drag = null; render(); } }, { passive: true });
@@ -300,7 +334,7 @@
   // layers: { board, cells: Map(k->state), clickable(r,c,state)->bool, marks: Map(k->cls), pieces:[{pieceId,row,col,rot,cls}], outlines:[{cells,color,pieceId,owner}], islands:Set(k), traps:Set(k) }
   function boardHTML(o) {
     const n = B(); const cs = cellSize(n + 1);
-    let h = `<div class="bwrap" data-zoomable="1"><div class="board${o.placing ? ' placing' : ''}" data-board="${esc(o.board)}" style="--n:${n};--cs:${cs}px">`;
+    let h = `<div class="bwrap" data-zoomable="1"><div class="board${o.placing ? ' placing' : ''}" data-board="${esc(o.board)}" data-cs="${cs}" style="--n:${n};--cs:${cs}px">`;
     h += `<div class="lab corner"></div>`;
     for (let c = 0; c < n; c++) h += `<div class="lab top">${c + 1}</div>`;
     const t = Date.now();
@@ -387,12 +421,41 @@
     else if (!S.st || !S.session) html = viewHome();
     else if (!S.cat.size) html = '<p class="muted">กำลังโหลด…</p>';
     else html = ({ LOBBY: viewLobby, PLACING: viewPlacing, BATTLE: viewBattle, GAME_OVER: viewOver })[S.st.phase]();
+    if (S.ageOk && !S.replaced) html = dockHTML(!!(S.st && S.session)) + html;   // v2.4 ปุ่มเสียง/แชท/เสียงสด
     if (S.modal) html += viewModal();
     app.innerHTML = html;
     document.querySelectorAll('.bwrap').forEach((el, i) => { if (scroll[i]) { el.scrollLeft = scroll[i][0]; el.scrollTop = scroll[i][1]; } });
     if (focusId) { const f = document.getElementById(focusId); if (f) { f.focus(); if (f.setSelectionRange) { const v = f.value; f.setSelectionRange(v.length, v.length); } } }
     updateTimer();
+    fitScreen();
   }
+
+  // [ใหม่ v2.5] R-10-13 พอดีจอ: ช่วงวางชิ้น/ยิง ย่อช่องกระดานให้ทั้งหน้าอยู่ในจอเดียว ถ้าพอดีแล้วล็อกไม่ให้เลื่อนหน้า
+  // ถ้าย่อถึงขั้นต่ำแล้วยังไม่พอ (จอเล็กมาก) = เลื่อนได้ตามปกติ · ซูมกระดานอยู่ (zoom > 1) = ไม่ย่อและไม่ล็อก
+  const FIT_MIN_CS = 18;
+  function fitScreen() {
+    const root = document.documentElement, app = $('#app');
+    root.classList.remove('noscroll');
+    if (!app || !S.st || !S.session || !(S.st.phase === 'PLACING' || S.st.phase === 'BATTLE') || S.zoom !== 1) return;
+    const board = document.querySelector('.board'); if (!board) return;
+    board.style.setProperty('--cs', board.dataset.cs + 'px');
+    const bs = getComputedStyle(document.body);
+    const pad = (parseFloat(bs.paddingTop) || 0) + (parseFloat(bs.paddingBottom) || 0);
+    const avail = Math.floor((window.visualViewport && window.visualViewport.height) || window.innerHeight);
+    const need = () => Math.ceil(app.getBoundingClientRect().height + pad);
+    const n = B() + 1;
+    for (let i = 0; i < 3 && need() > avail; i++) {
+      const cur = parseFloat(board.style.getPropertyValue('--cs'));
+      const next = Math.max(FIT_MIN_CS, Math.floor(cur - (need() - avail) / n) - 1);
+      if (next >= cur) break;
+      board.style.setProperty('--cs', next + 'px');
+    }
+    if (need() <= avail) root.classList.add('noscroll');
+  }
+  let fitTm; const refit = () => { clearTimeout(fitTm); fitTm = setTimeout(fitScreen, 80); };
+  window.addEventListener('resize', refit); window.addEventListener('orientationchange', refit);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fitScreen());
 
   function viewAge() {
     return `<section class="panel gate"><div class="stripe"></div><img class="logo" src="/icons/icon-192.png" alt=""><h1>Battle Weed: Green Social</h1>
@@ -558,7 +621,7 @@
       ${tools}
       <div class="muted">${readyTxt}</div>${warnHTML()}
       ${boardHTML({ board: 'me', placing: true, islands: islSet, pieces: ol.pieces, outlines: ol.outlines, ownCells: ol.ownCells, clickable: () => 'place' })}
-      <div class="legend"><span>แตะช่องว่าง = วาง (ช่องที่แตะ = มุมซ้ายบนของชิ้น) · แตะชิ้น = เลือก แล้วย้าย หมุน เอาออก · กดค้างที่ชิ้นแล้วลากได้</span>${S.st.settings.mode === 'survival' ? '<span>Survival: ของคนอื่นอาจทับช่องเดียวกับคุณได้ (มองไม่เห็น)</span>' : ''}</div>
+      <div class="legend"><span class="howto">แตะช่องว่าง = วาง (ช่องที่แตะ = มุมซ้ายบนของชิ้น) · แตะชิ้น = เลือก แล้วย้าย หมุน เอาออก · กดค้างที่ชิ้นแล้วลากได้</span>${S.st.settings.mode === 'survival' ? '<span>Survival: ของคนอื่นอาจทับช่องเดียวกับคุณได้ (มองไม่เห็น)</span>' : ''}</div>
       ${trayHTML()}
       ${draw ? `<button class="btn ghost" data-act="islmode">${S.islMode ? 'กลับไปวางชิ้น' : `วาดเกาะ (${S.isl.size}/${S.st.config.ISLAND_CELLS})`}</button>` : ''}
       <div class="row"><button class="btn ghost" data-act="suggest">สุ่มวางให้</button><button class="btn" data-act="confirm" ${all && islOk ? '' : 'disabled'}>ยืนยัน</button></div>
@@ -711,9 +774,16 @@
   function updateTimer() {
     const t = $('#timer'); const s = secsLeft();
     if (t) { t.textContent = s == null ? '' : `${s} วิ`; t.classList.toggle('low', s != null && s <= 5); }
-    const bc = $('#bigcount'); // R-10-06 นับถอยหลังตัวใหญ่จางกลางจอ เฉพาะตาเรา
-    if (bc) { const on = S.st && S.st.phase === 'BATTLE' && S.session && canShoot() && s != null;
-      bc.hidden = !on; if (on) { if (bc.textContent !== String(s)) bc.textContent = s; bc.classList.toggle('low', s <= 5); } }
+    const bc = $('#bigcount'); // R-10-06 [แก้ v2.4] ตัวเลขใหญ่ตอนเหลือ ≤ 5 วิ เฉพาะคนที่ต้องยิง
+    if (bc) {
+      const from = (S.st && S.st.config && S.st.config.COUNTDOWN_FROM) || 5;
+      const on = !!(S.st && S.st.phase === 'BATTLE' && S.session && canShoot() && s != null && s >= 1 && s <= from);
+      bc.hidden = !on;
+      if (on) {
+        if (bc.dataset.n !== String(s)) { bc.dataset.n = String(s); bc.textContent = s; bc.classList.remove('tick'); void bc.offsetWidth; bc.classList.add('tick'); SFX.play(s <= 1 ? 'tickLast' : 'tick'); }
+      } else bc.dataset.n = '';
+      SFX.intense(on);
+    }
     document.querySelectorAll('.grace').forEach(g => { const n = g.querySelector('.graceN'); if (n) n.textContent = Math.max(0, +g.dataset.base - Math.floor((Date.now() - S.recvAt) / 1000)); });
   }
   setInterval(updateTimer, 250);
@@ -756,7 +826,19 @@
     const el = e.target.closest('[data-act]'); if (!el) return;
     if (S.dragEndAt && Date.now() - S.dragEndAt < 400 && el.dataset.act === 'place') return; // คลิกที่ตามหลังการลาก
     const a = el.dataset.act; const r = +el.dataset.r, c = +el.dataset.c;
+    if (!['place', 'rot', 'chat-send', 'snd-fx', 'confirm'].includes(a)) SFX.play('click');
     switch (a) {
+      case 'snd-fx': SFX.setPref('fx', !SFX.pref('fx')); if (SFX.pref('fx')) SFX.play('click'); return render();
+      case 'snd-bgm': SFX.setPref('bgm', !SFX.pref('bgm')); return render();
+      case 'chat-open': S.sheet = S.sheet === 'chat' ? null : 'chat'; S.chat.unread = 0; renderSheet(); updateBadge(); return;
+      case 'voice-open': S.sheet = S.sheet === 'voice' ? null : 'voice'; renderSheet(); return;
+      case 'sheet-close': S.sheet = null; renderSheet(); return;
+      case 'chat-send': return sendChat();
+      case 'chat-hide': { const pid = el.dataset.pid; if (S.chat.hidden.has(pid)) S.chat.hidden.delete(pid); else S.chat.hidden.add(pid); renderSheet(); return; }
+      case 'voice-join': { const r = await VOICE.join(); if (r && !r.ok && r.error) toast(r.error); return; }
+      case 'voice-leave': await VOICE.leave(); return;
+      case 'voice-mic': VOICE.toggleMic(); return;
+      case 'voice-mute': VOICE.toggleMute(el.dataset.pid); return;
       case 'age-ok': S.ageOk = true; store.set('bw_age_ok', true); return render();
       case 'age-no': location.href = 'about:blank'; return;
       case 'create-open': if (!(S.name || '').trim()) { toast('ใส่ชื่อของคุณก่อน'); return; } S.createOpen = true; return render();
@@ -808,6 +890,7 @@
         return;
       }
       case 'confirm': {
+        SFX.play('ready');
         const placement = Object.entries(S.draft).map(([id, v]) => ({ pieceId: id, row: v.row, col: v.col, rot: v.rot }));
         const extra = { placement };
         if (S.st.settings.islands === 'draw') extra.islands = [...S.isl].map(k => [Math.floor(k / 100), k % 100]);
@@ -837,7 +920,7 @@
       case 'close': S.modal = null; return render();
       case 'rematch': await act('rematch', { want: true }); return;
       case 'lobby': await act('back_to_lobby'); return;
-      case 'leave': await emit('leave', {}); dropSession(); return;
+      case 'leave': await emit('leave', {}); try { VOICE.reset(); } catch (x) { /* */ } S.sheet = null; S.chat.log = []; S.chat.unread = 0; dropSession(); return;
       case 'take-back': S.replaced = false; socket.connect(); return;
       case 'install': // R-10-01
         if (installKind() === 'prompt') { const ev = S.installEvt; S.installEvt = null; ev.prompt(); try { await ev.userChoice; } catch (x) { /* */ } return render(); }
@@ -879,6 +962,98 @@
   }, { passive: false });
   document.addEventListener('touchend', e => { if (e.touches.length < 2) pinch = null; }, { passive: true });
   window.addEventListener('resize', () => { clearTimeout(render.rt); render.rt = setTimeout(render, 150); });
+
+
+  // ---------- v2.4 เสียง / แชท / เสียงสด ----------
+  // R-10-09 เสียงตามสถานะ (ตอนยิงอยู่ใน onResolve) · R-10-10 BGM ตาม phase
+  function stateSounds(st, prev) {
+    SFX.bgm(st.phase === 'PLACING' ? 'place' : st.phase === 'BATTLE' ? 'battle' : null);
+    if (!S.seen || !prev || prev.code !== st.code) return;      // เพิ่งเปิดหน้า / เข้าห้องใหม่ ไม่เล่นย้อนหลัง
+    const cnt = x => x.players.filter(p => !p.removed).length;
+    if (st.phase === 'LOBBY' && prev.phase === 'LOBBY') { if (cnt(st) > cnt(prev)) SFX.play('popUp'); else if (cnt(st) < cnt(prev)) SFX.play('popDown'); }
+    if (prev.phase !== 'PLACING' && st.phase === 'PLACING') SFX.play('start');
+    if (prev.phase !== 'GAME_OVER' && st.phase === 'GAME_OVER') {
+      const r = st.result || {};
+      SFX.play(r.winnerPid === st.you ? 'win' : (r.winnerPid ? 'elim' : 'draw'));
+    }
+  }
+  function dockHTML(inRoom) {
+    const fx = SFX.pref('fx'), bg = SFX.pref('bgm');
+    const vc = S.st && S.st.voice ? S.st.voice.length : 0;
+    const sp = VOICE.speaking.size > 0;
+    return `<div class="dock" role="toolbar" aria-label="เสียงและการคุย">
+      <button class="dockbtn ${fx ? '' : 'off'}" data-act="snd-fx" aria-pressed="${fx}" aria-label="เสียงเอฟเฟกต์ ${fx ? 'เปิดอยู่' : 'ปิดอยู่'}">${fx ? '🔊' : '🔇'}</button>
+      <button class="dockbtn ${bg ? '' : 'off'}" data-act="snd-bgm" aria-pressed="${bg}" aria-label="ดนตรีประกอบ ${bg ? 'เปิดอยู่' : 'ปิดอยู่'}">🎵</button>
+      ${inRoom ? `<button class="dockbtn" data-act="chat-open" aria-label="แชท">💬<b class="badge" ${S.chat.unread ? '' : 'hidden'}>${S.chat.unread}</b></button>` : ''}
+      ${inRoom && VOICE.supported ? `<button class="dockbtn ${VOICE.joined ? 'live' : ''} ${sp ? 'speak' : ''}" data-act="voice-open" aria-label="เสียงสด">🎙${vc ? `<b class="badge vc">${vc}</b>` : ''}</button>` : ''}
+    </div>`;
+  }
+  function updateBadge() {
+    const b = document.querySelector('.dockbtn[data-act="chat-open"] .badge'); if (!b) return;
+    b.textContent = S.chat.unread; b.hidden = !S.chat.unread;
+  }
+  const chatLine = m => `<div class="cm${S.st && m.pid === S.st.you ? ' mine' : ''}" data-pid="${esc(m.pid)}"><button class="cn" data-act="chat-hide" data-pid="${esc(m.pid)}" style="color:${esc(m.color)}" title="แตะเพื่อซ่อน/แสดงข้อความของคนนี้">${esc(m.name)}</button><span class="ct">${esc(m.text)}</span></div>`;
+  function addChat(m, live) {
+    if (!m || typeof m.text !== 'string') return;
+    S.chat.log.push(m); if (S.chat.log.length > 50) S.chat.log.shift();
+    if (!live) return;
+    const mine = S.st && m.pid === S.st.you;
+    if (S.sheet === 'chat') {
+      const list = $('#chatlist');
+      if (list && !S.chat.hidden.has(m.pid)) { const ph = list.querySelector('p'); if (ph) ph.remove(); list.insertAdjacentHTML('beforeend', chatLine(m)); list.scrollTop = list.scrollHeight; }
+    } else if (!mine && !S.chat.hidden.has(m.pid)) {
+      S.chat.unread++; updateBadge();
+      note(`${m.name}: ${m.text}`, 'chat');                     // ข้อความใหม่ลอยดูสั้น ๆ เมื่อกล่องปิด
+    }
+    if (!mine && !S.chat.hidden.has(m.pid)) SFX.play('chat');
+  }
+  async function sendChat() {
+    const inp = $('#in-chat'); if (!inp) return;
+    const text = inp.value.trim(); if (!text) return;
+    const r = await act('chat', { text });
+    if (r.ok) { inp.value = ''; S.chat.draft = ''; }
+    inp.focus();
+  }
+  function voiceBody() {
+    if (!VOICE.supported) return '<p class="muted">เบราว์เซอร์นี้ไม่รองรับเสียงสด</p>';
+    const st = S.st; const inV = (st.voice || []);
+    const rows = inV.map(pid => {
+      const p = pl(pid); if (!p) return '';
+      const self = pid === st.you; const sp = VOICE.speaking.has(pid); const c = VOICE.conn.get(pid);
+      const stat = self ? (VOICE.mic ? 'ไมค์เปิด' : 'ไมค์ปิด') : (VOICE.muted.has(pid) ? 'ปิดเสียงคนนี้' : (c === 'connected' ? 'ต่อแล้ว' : c === 'failed' ? 'ต่อไม่ได้' : 'กำลังต่อ…'));
+      return `<div class="vrow ${sp ? 'speak' : ''}"><span>${dot(p)}${esc(p.name)}${self ? ' (คุณ)' : ''}</span><span class="muted">${stat}</span>
+        ${self || !VOICE.joined ? '' : `<button class="btn ghost small" data-act="voice-mute" data-pid="${esc(pid)}">${VOICE.muted.has(pid) ? 'เปิดเสียง' : 'ปิดเสียง'}</button>`}</div>`;
+    }).join('') || '<p class="muted">ยังไม่มีใครเข้าร่วมเสียง</p>';
+    const ctl = VOICE.joined
+      ? `<div class="row"><button class="btn ${VOICE.mic ? 'fire' : ''}" data-act="voice-mic" ${VOICE.hasMic ? '' : 'disabled'}>${VOICE.mic ? '🎤 ปิดไมค์' : '🎤 เปิดไมค์พูด'}</button><button class="btn ghost" data-act="voice-leave">ออกจากเสียง</button></div>
+         ${VOICE.err === 'mic' ? '<div class="warn">ไม่ได้รับอนุญาตใช้ไมค์ — ฟังอย่างเดียวได้ ถ้าอยากพูดให้อนุญาตไมค์ในเบราว์เซอร์แล้วเข้าร่วมใหม่</div>' : ''}`
+      : `<button class="btn" data-act="voice-join" ${VOICE.busy ? 'disabled' : ''}>${VOICE.busy ? 'กำลังเชื่อมต่อ…' : '🎙 เข้าร่วมเสียง (ไมค์ปิดไว้ก่อน)'}</button>`;
+    return `${ctl}<div class="vlist">${rows}</div><p class="muted small">เสียงเชื่อมตรงระหว่างผู้เล่น ไม่ผ่านเซิร์ฟเวอร์ · บางเครือข่ายอาจต่อกันไม่ติด · ใส่หูฟังจะไม่มีเสียงสะท้อน</p>`;
+  }
+  function renderSheet() {
+    const el = $('#sheet'); if (!el) return;
+    if (!S.sheet || !S.st || !S.session) { el.hidden = true; el.innerHTML = ''; return; }
+    el.hidden = false;
+    if (S.sheet === 'chat') {
+      const lines = S.chat.log.filter(m => !S.chat.hidden.has(m.pid)).map(chatLine).join('');
+      el.innerHTML = `<section class="sheetbox" role="dialog" aria-label="แชท"><div class="row head"><h2>💬 แชทในห้อง</h2><button class="btn ghost small" data-act="sheet-close">ปิด</button></div>
+        <div id="chatlist" class="chatlist">${lines || '<p class="muted center">ยังไม่มีข้อความ</p>'}</div>
+        <div class="row nowrap"><input id="in-chat" maxlength="${(S.st.config && S.st.config.CHAT_MAX) || 100}" autocomplete="off" placeholder="พิมพ์ข้อความ…" value="${esc(S.chat.draft || '')}"><button class="btn small" data-act="chat-send">ส่ง</button></div>
+        <p class="muted small">แตะชื่อคนเพื่อซ่อน/แสดงข้อความของคนนั้นเฉพาะในเครื่องคุณ · ข้อความไม่ถูกเก็บถาวร</p></section>`;
+      const list = $('#chatlist'); if (list) list.scrollTop = list.scrollHeight;
+    } else {
+      el.innerHTML = `<section class="sheetbox" role="dialog" aria-label="เสียงสด"><div class="row head"><h2>🎙 เสียงสด</h2><button class="btn ghost small" data-act="sheet-close">ปิด</button></div><div id="voicebody" class="vbody">${voiceBody()}</div></section>`;
+    }
+  }
+  function refreshSheet() { if (S.sheet === 'voice') { const b = $('#voicebody'); if (b) b.innerHTML = voiceBody(); else renderSheet(); } }
+  VOICE.init({ socket, act });
+  VOICE.onChange = () => {
+    const b = document.querySelector('.dockbtn[data-act="voice-open"]');
+    if (b) { b.classList.toggle('speak', VOICE.speaking.size > 0); b.classList.toggle('live', VOICE.joined); }
+    refreshSheet();
+  };
+  document.addEventListener('input', e => { if (e.target.id === 'in-chat') S.chat.draft = e.target.value; });
+  document.addEventListener('keydown', e => { if (e.target.id === 'in-chat' && e.key === 'Enter') { e.preventDefault(); sendChat(); } });
 
   // ---------- M2: ติดตั้งเป็นแอป ----------
   window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; });

@@ -1,5 +1,5 @@
 'use strict';
-// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.3) — ไม่ import express/socket.io
+// กติกาทั้งหมดของ Battle Weed: Green Social (spec v2.5) — ไม่ import express/socket.io
 // รหัสกติกา R-x-yy อ้างถึงหัวข้อใน spec.md
 const crypto = require('crypto');
 
@@ -8,9 +8,10 @@ const CONFIG = Object.freeze({
   MIN_PLAYERS: 2,
   MAX_PLAYERS: 7,
   SIMUL_MIN_PLAYERS: 3,
-  CLASSIC_BOARD: 12,
+  CLASSIC_BOARD: 11,
   CLASSIC_FLEET: ['bong', 'grinder', 'pipe', 'joint', 'lighter'],
-  SURVIVAL_BOARD: { 2: 14, 3: 16, 4: 16, 5: 17, 6: 16, 7: 16 },
+  // [แก้ v2.5 D-51..D-53] ชุดชิ้นเดียวใช้ทุกโหมด 27 ช่อง (ไม่มี id รุ่น -s แล้ว) · กระดานเล็กลงตามสัดส่วน
+  SURVIVAL_BOARD: { 2: 13, 3: 15, 4: 15, 5: 16, 6: 17, 7: 17 },
   SURVIVAL_FLEET: {
     2: ['bong', 'grinder', 'pipe', 'joint', 'lighter'], 3: ['bong', 'grinder', 'pipe', 'joint', 'lighter'],
     4: ['grinder', 'pipe', 'joint', 'lighter'], 5: ['grinder', 'pipe', 'joint', 'lighter'],
@@ -35,6 +36,13 @@ const CONFIG = Object.freeze({
   ROOM_CODE_LEN: 4,                 // [แก้ v2.2] รหัสห้องตัวเลข 4 หลัก ตัวแรกไม่ใช่ 0
   ROOM_CODE_CHARS: '0123456789',
   NAME_MAX: 16,
+  CHAT_MAX: 100,                    // [ใหม่ v2.4] R-5-15 ตัวอักษรต่อข้อความ
+  CHAT_COOLDOWN_MS: 1000,           // [ใหม่ v2.4] ส่งถี่กว่านี้ไม่ได้
+  CHAT_KEEP: 30,                    // [ใหม่ v2.4] R-5-16 ข้อความล่าสุดที่เก็บต่อห้อง
+  VOICE_MAX: 7,                     // [ใหม่ v2.4] R-5-17
+  RTC_DATA_MAX: 8192,               // [ใหม่ v2.4] R-5-19 ไบต์ของข้อมูล signaling
+  TURN_BANNER_MS: 3000,             // [ใหม่ v2.5] R-10-12 แบนเนอร์ "ตาคุณ!" แสดงกี่ ms
+  COUNTDOWN_FROM: 5,                // [ใหม่ v2.4] R-10-06 นับถอยหลังตัวใหญ่เมื่อเหลือ ≤ ค่านี้
   ROOM_NAME_MAX: 20,                // [ใหม่ v2.3] R-5-09
   ROOM_PASSWORD_RE: /^[0-9]{4}$/,   // [ใหม่ v2.3] R-5-10 รหัสผ่านตัวเลข 4 หลัก
   MIN_AGE: 20,
@@ -69,6 +77,7 @@ class GameError extends Error {
 }
 const MSG = {
   ROOM_NAME_INVALID: 'ชื่อห้อง 1–20 ตัวอักษร', PASSWORD_INVALID: 'รหัสผ่านต้องเป็นตัวเลข 4 หลัก', BAD_PASSWORD: 'รหัสผ่านไม่ถูกต้อง',
+  CHAT_INVALID: 'ข้อความต้องยาว 1–100 ตัวอักษร', CHAT_RATE: 'ส่งข้อความถี่เกินไป รอสักครู่', VOICE_INVALID: 'ใช้เสียงสดตอนนี้ไม่ได้',
   ROOM_FULL: 'ห้องนี้เต็มหรือเริ่มเกมแล้ว', NAME_INVALID: 'กรุณาใส่ชื่อ 1–16 ตัวอักษร', BAD_PHASE: 'ทำแบบนี้ตอนนี้ไม่ได้',
   ALREADY_PLACED: 'ยืนยันการวางไปแล้ว', PLACEMENT_INVALID: 'การวางไม่ถูกต้อง', NOT_YOUR_TURN: 'ยังยิงไม่ได้ตอนนี้',
   OUT_OF_BOUNDS: 'พิกัดอยู่นอกกระดาน', ALREADY_SHOT: 'ช่องนี้ถูกยิงแล้ว', STALE_TURN: 'ตานี้ผ่านไปแล้ว',
@@ -132,6 +141,8 @@ class Room {
     this.turnPid = null; this.turnNo = 0; this.roundNo = 0; this.deadline = null;
     this.boards = new Map(); this.lastResolve = []; this.result = null; this.prev = null;
     this.elimCount = 0; this.emptySince = null; this.log = []; this.notices = [];
+    this.chatLog = []; this.chatSeq = 0; this.chatOut = [];   // [ใหม่ v2.4] R-5-16 แชท (ไม่เก็บถาวร ไม่ลง log)
+    this.voice = new Set();                                    // [ใหม่ v2.4] R-5-17 pid ที่เปิดเสียงสดอยู่
   }
 
   // ---------- เครื่องมือ ----------
@@ -192,7 +203,7 @@ class Room {
   setConnected(pid, on) {
     const s = this.seat(pid); if (!s) return;
     s.connected = on; s.disconnectedAt = on ? null : this.now();
-    if (!on) this._log('disconnect', { pid });
+    if (!on) { this.voice.delete(pid); this._log('disconnect', { pid }); }   // R-5-17 หลุด = ออกจากเสียงสด
     this._checkEmpty();
   }
   _checkEmpty() {
@@ -207,6 +218,7 @@ class Room {
   }
   _removeSeat(pid) {
     const s = this.players.find(p => p.pid === pid); if (!s) return;
+    this.voice.delete(pid);
     if (this.phase === 'LOBBY') this.players = this.players.filter(p => p.pid !== pid);
     else s.removed = true;
     this._fixHost(); this._checkEmpty();
@@ -390,8 +402,41 @@ class Room {
       case 'resign': return this._resign(s);
       case 'rematch': return this._rematch(s, msg.want);
       case 'back_to_lobby': return this._backToLobby(s);
+      case 'chat': return this._chat(s, msg.text);
+      case 'voice_join': return this._voiceJoin(s);
+      case 'voice_leave': this.voice.delete(s.pid); return {};
       default: throw err('BAD_REQUEST');
     }
+  }
+  // [ใหม่ v2.4] R-5-15 / R-5-16 แชทข้อความ (ทุก phase รวมคนตกรอบ) ข้อความไม่ลง event log
+  _chat(s, raw) {
+    if (typeof raw !== 'string') throw err('CHAT_INVALID');
+    const text = raw.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!text || [...text].length > this.C.CHAT_MAX) throw err('CHAT_INVALID');
+    const t = this.now();
+    if (s.lastChat != null && t - s.lastChat < this.C.CHAT_COOLDOWN_MS) throw err('CHAT_RATE');
+    s.lastChat = t;
+    const m = { id: ++this.chatSeq, pid: s.pid, name: s.name, color: s.color, text, t };
+    this.chatLog.push(m); if (this.chatLog.length > this.C.CHAT_KEEP) this.chatLog.shift();
+    this.chatOut.push(m);
+    return {};
+  }
+  drainChat() { const o = this.chatOut; this.chatOut = []; return o; }
+  chatHistory() { return this.chatLog.map(m => ({ ...m })); }
+  // [ใหม่ v2.4] R-5-17..R-5-19 เสียงสด: server เก็บแค่ว่าใครเปิดอยู่ และส่งต่อข้อความเชื่อมต่อ
+  _voiceJoin(s) {
+    if (!this.voice.has(s.pid) && this.voice.size >= this.C.VOICE_MAX) throw err('VOICE_INVALID');
+    this.voice.add(s.pid);
+    return { peers: [...this.voice].filter(p => p !== s.pid && this.seat(p) && this.seat(p).connected) };
+  }
+  // คืน pid ปลายทางที่ถูกต้อง หรือ throw VOICE_INVALID (ผู้ส่งและปลายทางอยู่ในห้องและอยู่ในเสียงสดทั้งคู่ ข้อมูล ≤ RTC_DATA_MAX)
+  rtcTarget(fromPid, toPid, kind, data) {
+    if (!this.seat(fromPid) || !this.seat(toPid) || fromPid === toPid) throw err('VOICE_INVALID');
+    if (!this.voice.has(fromPid) || !this.voice.has(toPid)) throw err('VOICE_INVALID');
+    if (!['offer', 'answer', 'ice'].includes(kind)) throw err('VOICE_INVALID');
+    let size; try { size = Buffer.byteLength(JSON.stringify(data) || ''); } catch (e) { throw err('VOICE_INVALID'); }
+    if (size > this.C.RTC_DATA_MAX) throw err('VOICE_INVALID');
+    return toPid;
   }
   // [ใหม่ v2.3] R-5-09 / R-5-10 ชื่อห้อง + สาธารณะ/ส่วนตัว + รหัสผ่าน
   setMeta(v) {
@@ -983,7 +1028,7 @@ class Room {
       settings: { ...this.settings }, turnStyle: this.turnStyle, boardSize: this.boardSize,
       fleet: this.fleet.map(f => f.id),
       turnPid: this.turnPid, turnNo: this.turnNo, roundNo: this.roundNo,
-      deadline: this.deadline, serverNow: t,
+      deadline: this.deadline, serverNow: t, voice: [...this.voice],
       lastResolve: this.lastResolve.map(x => ({ ...x })), lastSunk: this.lastSunk || [],
       result: this.result,
       boards,
@@ -991,6 +1036,7 @@ class Room {
         SHOT_TIME: C.SHOT_TIME, PLACE_TIME: C.PLACE_TIME, RECONNECT_GRACE: C.RECONNECT_GRACE, ISLAND_CELLS: C.ISLAND_CELLS,
         ISLAND_MIN_GROUP: C.ISLAND_MIN_GROUP, ANIM_BULLET_MS: C.ANIM_BULLET_MS, ANIM_EFFECT_MS: C.ANIM_EFFECT_MS,
         SUNK_REVEAL_MS: C.SUNK_REVEAL_MS, MIN_PLAYERS: C.MIN_PLAYERS, MAX_PLAYERS: C.MAX_PLAYERS,
+        COUNTDOWN_FROM: C.COUNTDOWN_FROM, TURN_BANNER_MS: C.TURN_BANNER_MS, CHAT_MAX: C.CHAT_MAX,
       },
       players: this.players.filter(p => !p.removed || reveal).map(p => ({
         pid: p.pid, name: p.name, color: p.color, connected: p.connected, ready: p.ready, alive: p.alive,

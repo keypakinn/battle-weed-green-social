@@ -73,6 +73,13 @@ function broadcast(room) {
     if (mine.length) s.emit('notice', mine);
   }
 }
+// [ใหม่ v2.4] ส่ง event ถึงทุกที่นั่งในห้อง (แชท R-5-16)
+function emitRoom(room, ev, payload) {
+  for (const [sid, info] of sockRoom) {
+    if (info.code !== room.code || !room.seat(info.pid)) continue;
+    const s = io.sockets.sockets.get(sid); if (s) s.emit(ev, payload);
+  }
+}
 function socketsOf(code, pid) {
   return [...sockRoom.entries()].filter(([, v]) => v.code === code && v.pid === pid).map(([sid]) => sid);
 }
@@ -117,6 +124,7 @@ io.on('connection', socket => {
     room.setMeta({ name: nm, private: q.private === true, password: q.private === true ? q.password : null }); // R-5-09, R-5-10
     rooms.set(code, room); listDirty = true; socket.leave('roomlist');
     detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    socket.emit('chat_log', room.chatHistory());
     return { code, pid, token };
   }));
   socket.on('join', (p, ack) => safe(ack, () => {
@@ -128,6 +136,7 @@ io.on('connection', socket => {
     const { pid, token } = room.addPlayer(obj(p).name);
     socket.leave('roomlist');
     detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    setImmediate(() => socket.emit('chat_log', room.chatHistory()));
     return { code, pid, token };
   }));
   socket.on('resume', (p, ack) => safe(ack, () => {
@@ -136,6 +145,7 @@ io.on('connection', socket => {
     if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่'); // R-8-10
     const pid = room.resume(obj(p).token);
     detach(socket); attach(socket, room, pid); scheduleBroadcast(room);
+    setImmediate(() => socket.emit('chat_log', room.chatHistory()));
     return { code, pid };
   }));
   socket.on('leave', (p, ack) => safe(ack, () => {
@@ -151,8 +161,23 @@ io.on('connection', socket => {
     const room = info && rooms.get(info.code);
     if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย กรุณาสร้างห้องใหม่');
     const r = room.action(info.pid, p);
+    for (const m of room.drainChat()) emitRoom(room, 'chat', m);          // R-5-16 แชทถึงทุกคนในห้อง
     scheduleBroadcast(room);
+    if (r && r.peers) return { peers: r.peers };                           // R-5-17 voice_join: รายชื่อที่ต้องส่ง offer ไปหา
     return r && r.placement !== undefined ? { placement: r.placement, islands: r.islands } : {};
+  }));
+  // [ใหม่ v2.4] R-5-19 ส่งต่อข้อความเชื่อมต่อเสียงสด (ไม่อ่าน ไม่เก็บ) ตรวจว่าอยู่ห้องเดียวกันและอยู่ในเสียงสดทั้งคู่
+  let rtcWin = 0, rtcCnt = 0;
+  socket.on('rtc', (p, ack) => safe(ack, () => {
+    const t = Date.now(); if (t - rtcWin > 10000) { rtcWin = t; rtcCnt = 0; }
+    if (++rtcCnt > 400) throw new GameError('VOICE_INVALID', 'ส่งข้อมูลถี่เกินไป');
+    const info = sockRoom.get(socket.id);
+    const room = info && rooms.get(info.code);
+    if (!room) throw new GameError('ROOM_NOT_FOUND', 'การเชื่อมต่อหาย');
+    const q = obj(p);
+    const to = room.rtcTarget(info.pid, String(q.to || ''), q.kind, q.data);
+    for (const sid of socketsOf(room.code, to)) { const s = io.sockets.sockets.get(sid); if (s) s.emit('rtc', { from: info.pid, kind: q.kind, data: q.data }); }
+    return {};
   }));
   // [ใหม่ v2.3] R-5-12 รายการห้อง: หน้าแรกสมัครรับ อัปเดตเมื่อมีการเปลี่ยน
   socket.on('list_rooms', (p, ack) => safe(ack, () => { socket.join('roomlist'); return { rooms: roomList() }; }));
