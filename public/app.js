@@ -21,6 +21,7 @@
     ageOk: store.get('bw_age_ok') === true,                       // R-5-03
     session: ss.get('bw_session') || store.get('bw_session'),
     cat: new Map(), fit: {}, ver: '0',
+    fitKey: '', fitCs: 0, fitLock: false,                         // v2.5.1 ขนาดช่องที่คำนวณไว้แล้วของสภาพจอปัจจุบัน
     st: null, offset: 0, recvAt: 0,
     name: store.get('bw_name') || '',
     // v2.3 ห้องรอ: ลิงก์เชิญ ?room=1234&pw=0420 (R-5-14)
@@ -226,6 +227,12 @@
     for (const [r, c] of absCells({ pieceId: id, row, col, rot })) if (taken.has(kk(r, c))) return { why: 'OVERLAP', with: taken.get(kk(r, c)) };
     return null;
   }
+  // [ใหม่ v2.5.1] R-7-11 แตะ/ลากจนชิ้นจะล้นกระดาน = ขยับชิ้นเข้ามาชิดขอบกระดานแทน (ไม่ขึ้น "วางนอกกระดานไม่ได้")
+  function clampPos(id, row, col, rot) {
+    const cells = rotateCells(piece(id).cells, rot);
+    const h = Math.max(...cells.map(x => x[0])) + 1, w = Math.max(...cells.map(x => x[1])) + 1;
+    return { row: Math.max(0, Math.min(row, B() - h)), col: Math.max(0, Math.min(col, B() - w)) };
+  }
   const whyText = f => f.why === 'BOUNDS' ? 'ไม่สามารถวางออกนอกกระดานได้' : `ไม่สามารถวางทับ${piece(f.with).name}ได้`;
   const nextUnplaced = () => S.st.fleet.find(id => !S.draft[id]) || null;
   function placeAt(r, c) {
@@ -239,12 +246,13 @@
     const here = draftCells().get(kk(r, c));
     if (here) { S.sel = S.sel === here ? null : here; return render(); }       // แตะชิ้น = เลือก / แตะซ้ำ = เลิกเลือก
     if (S.sel) {                                                               // ย้ายชิ้นที่เลือกไปช่องที่แตะ
-      const v = S.draft[S.sel]; const bad = fits(S.sel, r, c, v.rot);
+      const v = S.draft[S.sel]; ({ row: r, col: c } = clampPos(S.sel, r, c, v.rot)); const bad = fits(S.sel, r, c, v.rot);
       if (bad) { SFX.play('invalid'); return toast(whyText(bad)); }
       S.draft[S.sel] = { ...v, row: r, col: c }; SFX.play('place'); return render();
     }
     const id = S.pick && !S.draft[S.pick] ? S.pick : nextUnplaced();
     if (!id) return toast('วางครบแล้ว แตะชิ้นบนกระดานเพื่อย้าย หมุน หรือเอาออก');
+    ({ row: r, col: c } = clampPos(id, r, c, 0));
     const bad = fits(id, r, c, 0);
     if (bad) { SFX.play('invalid'); return toast(whyText(bad)); }
     S.draft[id] = { row: r, col: c, rot: 0 }; SFX.play('place');
@@ -295,7 +303,7 @@
     const d = S.drag; if (!d) return false;
     if (!d.active) { if (Math.hypot(x - d.x0, y - d.y0) > 8) { clearTimeout(d.timer); S.drag = null; } return false; }
     const el = document.elementFromPoint(x, y); const cell = el && el.closest && el.closest('.board.placing .cell[data-r]');
-    if (cell) { const row = +cell.dataset.r - d.dr, col = +cell.dataset.c - d.dc; if (!d.pos || d.pos.row !== row || d.pos.col !== col) dragDraw(row, col); }
+    if (cell) { const { row, col } = clampPos(d.id, +cell.dataset.r - d.dr, +cell.dataset.c - d.dc, S.draft[d.id].rot); if (!d.pos || d.pos.row !== row || d.pos.col !== col) dragDraw(row, col); }
     return true;
   }
   function dragEnd() {
@@ -328,6 +336,7 @@
 
   // ---------- กระดาน ----------
   function cellSize(nCols) {
+    if (S.fitCs && S.fitKey === fitKey()) return S.fitCs;      // [v2.5.1] วาดด้วยขนาดที่จำไว้ตั้งแต่เฟรมแรก ไม่ใหญ่แล้วหดให้เห็น
     const w = Math.min(document.documentElement.clientWidth, 560) - 24 - 16;
     return Math.max(14, Math.floor(w / nCols)) * S.zoom;
   }
@@ -361,22 +370,23 @@
           : `<div class="${cls.join(' ')}" style="${style}" data-k="${k}" aria-label="${label}">${inner}</div>`;
       }
     }
-    h += `<div class="layer" style="left:${cs}px;top:${cs}px">`;
+    h += `<div class="layer" style="left:var(--cs);top:var(--cs)">`;
     for (const p of o.pieces || []) h += pieceImg(p, cs);
     for (const ol of o.outlines || []) h += outlineHTML(ol, cs);
     h += `</div></div></div>`;
     return h;
   }
+  const U = k => `calc(var(--cs) * ${+(+k).toFixed(4)})`; // [แก้ v2.5.1] ตำแหน่งภาพ/เส้นขอบตาม --cs (เดิมเป็น px คงที่ พอย่อพอดีจอแล้วภาพไม่ตรงช่อง)
   function pieceImg(p, cs) { // ภาพชิ้นตาม fit.json (หมุนได้ ไม่กลับด้าน)
     const f = S.fit[p.pieceId];
     const pc = piece(p.pieceId);
     const rows = f ? f.rows : Math.max(...pc.cells.map(x => x[0])) + 1, cols = f ? f.cols : Math.max(...pc.cells.map(x => x[1])) + 1;
     const odd = p.rot % 2 === 1;
-    const W = (odd ? rows : cols) * cs, H = (odd ? cols : rows) * cs;
-    const inner = f ? `<img src="${artURL(p.pieceId)}" alt="" style="left:${f.x * cs}px;top:${f.y * cs}px;width:${f.w * cs}px;height:${f.h * cs}px" onerror="this.remove()">`
+    const W = odd ? rows : cols, H = odd ? cols : rows; // หน่วย = ช่อง
+    const inner = f ? `<img src="${artURL(p.pieceId)}" alt="" style="left:${U(f.x)};top:${U(f.y)};width:${U(f.w)};height:${U(f.h)}" onerror="this.remove()">`
       : `<span class="pname">${esc(pc.name)}</span>`;
-    return `<div class="pimg ${p.cls || ''}" data-pid="${esc(p.pieceId)}" style="left:${p.col * cs}px;top:${p.row * cs}px;width:${W}px;height:${H}px">
-      <div class="prot" style="width:${cols * cs}px;height:${rows * cs}px;left:${(W - cols * cs) / 2}px;top:${(H - rows * cs) / 2}px;transform:rotate(${p.rot * 90}deg)">${inner}</div></div>`;
+    return `<div class="pimg ${p.cls || ''}" data-pid="${esc(p.pieceId)}" style="left:${U(p.col)};top:${U(p.row)};width:${U(W)};height:${U(H)}">
+      <div class="prot" style="width:${U(cols)};height:${U(rows)};left:${U((W - cols) / 2)};top:${U((H - rows) / 2)};transform:rotate(${p.rot * 90}deg)">${inner}</div></div>`;
   }
   function outlineHTML(ol, cs) { // R-10-03 เส้นขอบสีเจ้าของ + ภาพย่อ
     const set = new Set(ol.cells.map(([r, c]) => kk(r, c)));
@@ -385,7 +395,7 @@
       const sides = [];
       if (!set.has(kk(r - 1, c))) sides.push('border-top'); if (!set.has(kk(r + 1, c))) sides.push('border-bottom');
       if (!set.has(kk(r, c - 1))) sides.push('border-left'); if (!set.has(kk(r, c + 1))) sides.push('border-right');
-      h += `<div class="oline ${ol.cls || ''}" data-pid="${esc(ol.pieceId || '')}" style="left:${c * cs}px;top:${r * cs}px;width:${cs}px;height:${cs}px;${sides.map(s => `${s}:${ol.w || 3}px solid ${ol.color}`).join(';')}"></div>`;
+      h += `<div class="oline ${ol.cls || ''}" data-pid="${esc(ol.pieceId || '')}" style="left:${U(c)};top:${U(r)};width:var(--cs);height:var(--cs);${sides.map(s => `${s}:${ol.w || 3}px solid ${ol.color}`).join(';')}"></div>`;
     }
     return h;
   }
@@ -433,29 +443,45 @@
   // [ใหม่ v2.5] R-10-13 พอดีจอ: ช่วงวางชิ้น/ยิง ย่อช่องกระดานให้ทั้งหน้าอยู่ในจอเดียว ถ้าพอดีแล้วล็อกไม่ให้เลื่อนหน้า
   // ถ้าย่อถึงขั้นต่ำแล้วยังไม่พอ (จอเล็กมาก) = เลื่อนได้ตามปกติ · ซูมกระดานอยู่ (zoom > 1) = ไม่ย่อและไม่ล็อก
   const FIT_MIN_CS = 18;
+  // [แก้ v2.5.1 D-56] คำนวณขนาดช่องครั้งเดียวต่อ "สภาพจอหนึ่งแบบ" แล้วจำไว้ (S.fitCs/S.fitKey)
+  // render รอบถัดไปใช้ค่าที่จำไว้เลย ไม่วัดใหม่ ไม่ปลด/ใส่ noscroll สลับไปมา = กระดานไม่กระตุกทุกครั้งที่กดปุ่ม
+  const fitKey = () => `${S.st && S.st.phase}|${S.st ? B() : 0}|${window.innerWidth}|${S.zoom}`;
+  const isTyping = () => { const a = document.activeElement; return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
   function fitScreen() {
     const root = document.documentElement, app = $('#app');
-    root.classList.remove('noscroll');
-    if (!app || !S.st || !S.session || !(S.st.phase === 'PLACING' || S.st.phase === 'BATTLE') || S.zoom !== 1) return;
+    const on = !!(app && S.st && S.session && (S.st.phase === 'PLACING' || S.st.phase === 'BATTLE') && S.zoom === 1);
+    if (!on) { root.classList.remove('noscroll'); S.fitKey = ''; S.fitCs = 0; return; }
     const board = document.querySelector('.board'); if (!board) return;
-    board.style.setProperty('--cs', board.dataset.cs + 'px');
+    const key = fitKey();
     const bs = getComputedStyle(document.body);
     const pad = (parseFloat(bs.paddingTop) || 0) + (parseFloat(bs.paddingBottom) || 0);
-    const avail = Math.floor((window.visualViewport && window.visualViewport.height) || window.innerHeight);
+    const avail = Math.floor(window.innerHeight);   // ไม่ใช้ visualViewport: ค่ามันหดตอนแป้นพิมพ์เด้ง
     const need = () => Math.ceil(app.getBoundingClientRect().height + pad);
+    // สภาพจอเดิม = ไม่วัด/ไม่ย่อกระดานใหม่ (กันกระตุก) แต่ยังเช็กว่าควรล็อกเลื่อนไหม เผื่อเนื้อหาในหน้ายาวขึ้น เช่น มีข้อความแจ้งเพิ่ม
+    if (key === S.fitKey && S.fitCs) { S.fitLock = need() <= avail; root.classList.toggle('noscroll', S.fitLock); return; }
+    board.style.setProperty('--cs', board.dataset.cs + 'px');
     const n = B() + 1;
-    for (let i = 0; i < 3 && need() > avail; i++) {
+    for (let i = 0; i < 8 && need() > avail; i++) {   // v2.5.1 วัดรอบเดียวจึงต้องลองให้ครบ (เดิมอาศัยว่า render ทุกครั้งเรียกซ้ำ)
       const cur = parseFloat(board.style.getPropertyValue('--cs'));
       const next = Math.max(FIT_MIN_CS, Math.floor(cur - (need() - avail) / n) - 1);
       if (next >= cur) break;
       board.style.setProperty('--cs', next + 'px');
     }
-    if (need() <= avail) root.classList.add('noscroll');
+    S.fitKey = key; S.fitCs = parseFloat(board.style.getPropertyValue('--cs')); S.fitLock = need() <= avail;
+    root.classList.toggle('noscroll', !!S.fitLock);
   }
-  let fitTm; const refit = () => { clearTimeout(fitTm); fitTm = setTimeout(fitScreen, 80); };
-  window.addEventListener('resize', refit); window.addEventListener('orientationchange', refit);
-  if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fitScreen());
+  // คำนวณใหม่เฉพาะตอนหมุนจอ หรือความกว้างจอเปลี่ยน (แถบที่อยู่ Safari ยืดหด = ความสูงเปลี่ยนอย่างเดียว ไม่คำนวณใหม่)
+  let fitTm, lastW = window.innerWidth, lastH = window.innerHeight;
+  const invalidateFit = () => { S.fitKey = ''; S.fitCs = 0; clearTimeout(fitTm); fitTm = setTimeout(() => { fitScreen(); render(); }, 80); };
+  window.addEventListener('resize', () => {
+    const w = window.innerWidth, h = window.innerHeight, wCh = w !== lastW;
+    lastW = w;
+    if (isTyping()) { lastH = h; return; }                 // แป้นพิมพ์เด้ง = ไม่แตะกระดาน
+    const bigH = Math.abs(h - lastH) > 150; lastH = h;     // ความสูงเปลี่ยนมาก = หมุนจอ/ย่อหน้าต่าง ไม่ใช่แถบ Safari
+    if (wCh || bigH) invalidateFit();
+  });
+  window.addEventListener('orientationchange', invalidateFit);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { S.fitKey = ''; fitScreen(); });
 
   function viewAge() {
     return `<section class="panel gate"><div class="stripe"></div><img class="logo" src="/icons/icon-192.png" alt=""><h1>Battle Weed: Green Social</h1>
