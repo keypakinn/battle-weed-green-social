@@ -85,8 +85,10 @@ function round(x, over = {}, skip = []) {
     let shots = over[pid];
     if (!shots) {
       shots = [];
+      const opps = x.room.alive().filter(p => p.pid !== pid).map(p => p.pid);
       while (shots.length < s.shotsAllowed) {
-        const board = x.room.settings.mode === 'classic' ? x.room.alive().find(p => p.pid !== pid).pid : undefined;
+        // [v2.7] Classic: นัดพื้นฐานต้องคนละกระดาน จึงวนไปทีละคน
+        const board = x.room.settings.mode === 'classic' ? opps[shots.length % opps.length] : undefined;
         const bd = x.room.boards.get(board || '*');
         const free = EMPTY.find(([r, c]) => !bd.shot.has(x.room._key(r, c)) && !used.has(`${board || '*'}|${r},${c}`) && !bd.traps.has(x.room._key(r, c)) && !x.room._occupants(board || '*', x.room._key(r, c), new Set(x.room.alive().map(p => p.pid))).islands.length);
         used.add(`${board || '*'}|${free[0]},${free[1]}`);
@@ -265,12 +267,13 @@ test('T-18 rounds โดนแล้วรอบหน้า 2 นัด · ส�
   round(x);
   assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 1);
 });
-test('T-19 rounds โดนชิ้น + โดนเกาะ = 2 นัด ไม่ใช่ 3 [R-7-52, R-7-42]', () => {
+test('T-19 [แก้ v2.7] rounds โดน 2 นัด (ชิ้น + เกาะ) = รอบหน้าได้พื้นฐาน 1 + โบนัส 2 = 3 นัด [R-7-52, R-7-42, R-7-18]', () => {
   const x = start(3, { mode: 'classic', islands: 'random' });
   const isl = seatOf(x, x.P[1]).islands[0][0];
   round(x, { [x.P[0]]: [shot(0, 0, x.P[1])] });
   round(x, { [x.P[0]]: [shot(1, 0, x.P[1]), shot(...x.room._rc(isl), x.P[1])] });
-  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 2);
+  assert.strictEqual(seatOf(x, x.P[0]).shotsAllowed, 3);
+  assert.strictEqual(seatOf(x, x.P[0]).shotsBase, 1);
 });
 test('T-20 นัดที่ระบบยิงแทนไม่ได้สิทธิ์ [R-7-43]', () => {
   const x = start(3, { mode: 'classic' });
@@ -354,11 +357,11 @@ test('T-28 Survival 2 คน ตกรอบพร้อมกัน: hitsOnOthe
     else assert.strictEqual(x.room.result.reason, 'draw');
   }
 });
-test('T-29 rounds มีคนได้ 2 นัด = 20 วิ · ทุกคนส่งครบ = ตัดสินทันที [R-8-03]', () => {
+test('T-29 [แก้ v2.7] rounds มีคนได้นัดโบนัส = ใช้เวลาที่ host ตั้ง ไม่ยืดเป็น 20 วิแล้ว · ทุกคนส่งครบ = ตัดสินทันที [R-8-03]', () => {
   const x = start(3, { mode: 'classic' });
   assert.strictEqual(x.room.deadline - T, 15000);
   round(x, { [x.P[0]]: [shot(0, 0, x.P[1])] });
-  assert.strictEqual(x.room.deadline - T, 20000);
+  assert.strictEqual(x.room.deadline - T, 15000);
   const r = x.room.roundNo; round(x); assert.strictEqual(x.room.roundNo, r + 1);
 });
 test('T-30 rounds ไม่ส่ง 3 รอบติด = ยิงแทนทุกรอบ แล้วตกรอบ auto_limit [R-8-03, R-8-04]', () => {
@@ -528,9 +531,10 @@ test('T-46 turns ไม่ได้เลือกช่อง หมดเว�
 test('T-47 rounds ได้ 2 นัด เลือกไว้ 1 = นัดนั้นยิงเอง อีกนัดสุ่ม ไม่นับยิงแทน [R-8-14]', () => {
   const x = start(3, { mode: 'survival' });
   const [a, b, c] = x.P;
-  seatOf(x, a).shotsAllowed = 2; seatOf(x, a).autoStreak = 2;
+  seatOf(x, a).bonusShots = 1; seatOf(x, a).autoStreak = 2;   // [v2.7] โบนัส 1 นัด -> รอบนี้ได้ 2 นัด
   x.room._beginRound();
-  assert.strictEqual(x.room.deadline - T, 20000);
+  assert.strictEqual(seatOf(x, a).shotsAllowed, 2);
+  assert.strictEqual(x.room.deadline - T, 15000);
   aim(x, a, [shot(5, 8)]);
   round(x, {}, [a]);
   T += 20000; x.room.tick();
@@ -790,6 +794,86 @@ test('T-75 getState ส่งค่าแบนเนอร์ตาเล่น
   assert.strictEqual(x.room.getState(x.P[0]).config.TURN_BANNER_MS, 3000);
   assert.strictEqual(CONFIG.CLASSIC_BOARD, 11);
   assert.deepStrictEqual(CONFIG.SURVIVAL_BOARD, { 2: 13, 3: 15, 4: 15, 5: 16, 6: 17, 7: 17 });
+});
+test('T-84 [v2.7] ตั้ง shotsPerTurn / shotTime: ค่าที่ถูกผ่าน · นอกช่วงหรือผิดชนิด = SETTINGS_INVALID · ตั้งได้เฉพาะ host ในล็อบบี้ [R-5-20, R-5-21]', () => {
+  const r = new Room('S001', { cards: CARDS, rand: mulberry32(1), now: clock, config: LEGACY });
+  const a = r.addPlayer('เอ').pid, b = r.addPlayer('บี').pid;
+  assert.deepStrictEqual([r.settings.shotsPerTurn, r.settings.shotTime], [1, 15], 'ค่าเริ่มต้น');
+  r.action(a, { type: 'update_settings', settings: { shotsPerTurn: 5, shotTime: 40 } });
+  assert.deepStrictEqual([r.settings.shotsPerTurn, r.settings.shotTime], [5, 40]);
+  for (const bad of [{ shotsPerTurn: 0 }, { shotsPerTurn: 7 }, { shotsPerTurn: 2.5 }, { shotsPerTurn: '3' }, { shotTime: 12 }, { shotTime: '15' }])
+    throwsCode(() => r.action(a, { type: 'update_settings', settings: bad }), 'SETTINGS_INVALID');
+  throwsCode(() => r.action(b, { type: 'update_settings', settings: { shotsPerTurn: 2 } }), 'NOT_HOST');
+  assert.deepStrictEqual([r.settings.shotsPerTurn, r.settings.shotTime], [5, 40], 'ค่าผิดต้องไม่ถูกเขียนทับ');
+});
+test('T-85 [v2.7] นัดพื้นฐาน = min(ค่าที่ตั้ง, คู่แข่งที่ยังอยู่) และลดลงเมื่อมีคนตกรอบ [R-7-17, D-65]', () => {
+  const x = start(5, { mode: 'survival', shotsPerTurn: 4 }, 11);
+  for (const p of x.room.alive()) assert.strictEqual(seatOf(x, p.pid).shotsBase, 4, '5 คน คู่แข่ง 4');
+  x.room._eliminate([seatOf(x, x.P[3]), seatOf(x, x.P[4])], 'sunk');
+  x.room._beginRound();
+  for (const p of x.room.alive()) assert.strictEqual(seatOf(x, p.pid).shotsBase, 2, 'เหลือ 3 คน คู่แข่ง 2');
+  const y = start(2, { mode: 'classic', shotsPerTurn: 5 }, 12);
+  assert.strictEqual(y.room.turnStyle, 'turns');
+  assert.strictEqual(y.room._baseShots(seatOf(y, y.P[0])), 1, '2 คน ยิงได้ 1 นัดเสมอ');
+});
+test('T-86 [v2.7] Classic: นัดพื้นฐานต้องยิงคนละกระดาน · ยิงซ้ำ = BOARD_REPEAT · นัดโบนัสยิงซ้ำได้ [R-7-17, R-7-18]', () => {
+  const x = start(3, { mode: 'classic', shotsPerTurn: 2 }, 13);
+  const [a, b, c] = x.P;
+  assert.strictEqual(seatOf(x, a).shotsAllowed, 2);
+  throwsCode(() => fire(x, a, [shot(0, 0, b), shot(0, 1, b)]), 'BOARD_REPEAT');
+  throwsCode(() => x.room.action(a, { type: 'aim', turnNo: x.room.turnNo, shots: [shot(0, 0, b), shot(0, 1, b)] }), 'BOARD_REPEAT');
+  fire(x, a, [shot(0, 0, b), shot(0, 1, c)]);          // คนละกระดาน = ผ่าน
+  assert.ok(seatOf(x, a).pending);
+  // นัดโบนัส: ให้ a มีโบนัส 1 นัด แล้วยิง 3 นัดโดยซ้ำกระดานได้ 1 นัด
+  round(x, {}, []);
+  seatOf(x, a).bonusShots = 1; x.room._beginRound();
+  assert.deepStrictEqual([seatOf(x, a).shotsBase, seatOf(x, a).shotsAllowed], [2, 3]);
+  fire(x, a, [shot(2, 0, b), shot(2, 1, c), shot(2, 2, b)]);
+  assert.ok(seatOf(x, a).pending, 'ซ้ำได้ 1 นัดเพราะมีโบนัส 1');
+});
+test('T-87 [v2.7] Survival: ยิงหลายนัดบนกระดานรวมได้ แต่ช่องเดิมซ้ำยังถูกปฏิเสธ [R-7-17]', () => {
+  const x = start(4, { mode: 'survival', shotsPerTurn: 3 }, 14);
+  const a = x.P[0];
+  assert.strictEqual(seatOf(x, a).shotsAllowed, 3);
+  throwsCode(() => fire(x, a, [shot(0, 0), shot(0, 1), shot(0, 0)]), 'ALREADY_SHOT');
+  fire(x, a, [shot(0, 0), shot(0, 1), shot(0, 2)]);
+  assert.strictEqual(seatOf(x, a).pending.length, 3);
+});
+test('T-88 [v2.7] โบนัส = จำนวนนัดที่โดน · Survival นัดโบนัสที่โดนไม่ต่อโบนัส · Classic ต่อได้ [R-7-18]', () => {
+  // Survival: จัดกระดานให้ยิงโดนแน่ 2 นัด
+  const x = start(3, { mode: 'survival', shotsPerTurn: 2 }, 15);
+  const a = x.P[0];
+  const unshot = ks => ks.filter(k => !x.room.boards.get('*').shot.has(k));
+  const tgt = unshot(seatOf(x, x.P[1]).pieces[0].cells).slice(0, 2).map(k => x.room._rc(k));
+  round(x, { [a]: tgt.map(([r, c]) => shot(r, c)) });
+  assert.strictEqual(seatOf(x, a).bonusShots, 2, 'โดน 2 นัด = โบนัส 2');
+  assert.strictEqual(seatOf(x, a).shotsAllowed, 4, 'พื้นฐาน 2 + โบนัส 2');
+  // รอบนี้ให้โดนเฉพาะนัดโบนัส (นัดที่ 3-4) -> Survival ต้องไม่ได้โบนัสต่อ
+  const p2 = unshot(seatOf(x, x.P[2]).pieces.flatMap(q => q.cells)).slice(0, 2).map(k => x.room._rc(k));
+  const empty = [];
+  for (let r = 0; r < x.room.boardSize && empty.length < 2; r++)
+    for (let c = 0; c < x.room.boardSize && empty.length < 2; c++) {
+      const k = x.room._key(r, c);
+      if (!x.room.boards.get('*').shot.has(k) && !x.room.alive().some(p => p.pieces.some(q => q.cells.includes(k)))) empty.push([r, c]);
+    }
+  round(x, { [a]: [...empty.map(([r, c]) => shot(r, c)), ...p2.map(([r, c]) => shot(r, c))] });
+  assert.strictEqual(seatOf(x, a).bonusShots, 0, 'Survival: นัดโบนัสที่โดนไม่สร้างโบนัสต่อ');
+  // Classic: นับทุกนัดรวมนัดโบนัส
+  const y = start(3, { mode: 'classic', shotsPerTurn: 1 }, 16);
+  const ya = y.P[0], yb = y.P[1];
+  const cells = seatOf(y, yb).pieces[0].cells.slice(0, 3).map(k => y.room._rc(k));
+  round(y, { [ya]: [shot(...cells[0], yb)] });
+  assert.strictEqual(seatOf(y, ya).shotsAllowed, 2, 'โดน 1 = รอบหน้า 2 นัด');
+  round(y, { [ya]: [shot(...cells[1], yb), shot(...cells[2], y.P[2])] });
+  assert.ok(seatOf(y, ya).bonusShots >= 1, 'Classic ต่อโบนัสได้');
+});
+test('T-89 [v2.7] settings.shotTime เปลี่ยนเส้นตายจริงทั้ง turns และ rounds [R-5-21]', () => {
+  const a = start(2, { mode: 'classic', shotTime: 40 }, 17);
+  assert.strictEqual(a.room.deadline - T, 40000, 'turns');
+  const b = start(4, { mode: 'survival', shotTime: 10 }, 18);
+  assert.strictEqual(b.room.deadline - T, 10000, 'rounds');
+  b.room._beginRound();
+  assert.strictEqual(b.room.deadline - T, 10000, 'รอบถัดไปก็ใช้ค่าเดียวกัน');
 });
 let fail = 0;
 for (const [name, fn] of tests) {

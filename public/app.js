@@ -634,7 +634,21 @@
       <div class="optgrp"><span class="muted">โหมด</span>${opt('mode', 'classic', s.mode, MODE_TXT.classic)}${opt('mode', 'survival', s.mode, MODE_TXT.survival)}</div>
       <label class="opt"><input type="checkbox" ${s.bonusOnHit ? 'checked' : ''} ${dis} data-set="bonusOnHit"> โดนแล้วได้ยิงเพิ่ม</label>
       <div class="optgrp"><span class="muted">เกาะส่วนตัว</span>${['off', 'random', 'draw'].map(v => opt('islands', v, s.islands, ISL_TXT[v])).join('')}</div>
-      <label class="opt"><input type="checkbox" ${s.traps ? 'checked' : ''} ${dis} data-set="traps"> ช่องกับดัก</label></section>`;
+      <label class="opt"><input type="checkbox" ${s.traps ? 'checked' : ''} ${dis} data-set="traps"> ช่องกับดัก</label>
+      ${shotOptsHTML(dis)}</section>`;
+  }
+  // [ใหม่ v2.7] R-5-20, R-5-21 ตัวเลือก "นัดต่อตา" และ "เวลาต่อตา"
+  function shotOptsHTML(dis) {
+    const s = S.st.settings;
+    const n = S.st.players.filter(p => !p.removed).length;
+    const maxNow = Math.max(1, n - 1);                       // เพดานตามจำนวนคนในห้องตอนนี้
+    const cap = (S.st.config.MAX_PLAYERS || 7) - 1;
+    const btn = (k, v, txt, off) => `<label class="opt${off ? ' off' : ''}"><input type="radio" name="${k}" value="${v}" ${v === s[k] ? 'checked' : ''} ${dis || off ? 'disabled' : ''} data-set="${k}" data-num="1"> ${txt}</label>`;
+    const shots = []; for (let v = 1; v <= cap; v++) shots.push(btn('shotsPerTurn', v, v, v > maxNow));
+    const times = (S.st.config.SHOT_TIME_CHOICES || [10, 15, 20, 25, 30, 40]).map(v => btn('shotTime', v, v + ' วิ'));
+    return `<div class="optgrp"><span class="muted">นัดต่อตา</span>${shots.join('')}</div>
+      <p class="muted small">สูงสุดเท่าจำนวนผู้เล่นลบหนึ่ง (ตอนนี้ ${maxNow}) · ${S.st.settings.mode === 'classic' ? 'นัดพื้นฐานต้องยิงคนละกระดาน' : 'ยิงที่ไหนก็ได้บนกระดานรวม'} · เล่น 2 คนยิงได้ 1 นัดเสมอ</p>
+      <div class="optgrp"><span class="muted">เวลาต่อตา</span>${times.join('')}</div>`;
   }
   // R-5-10 / R-5-14 ลิงก์เชิญของห้องส่วนตัวมีรหัสผ่านติดไป
   const inviteLink = () => `${location.origin}/?room=${S.st.code}${S.st.room && S.st.room.private && S.st.room.password ? `&pw=${S.st.room.password}` : ''}`;
@@ -904,7 +918,8 @@
       const r = await act('room_meta', { meta }); if (!r.ok) render(); return;
     }
     const k = d.set; if (!k) return;
-    const v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+    let v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+    if (d.num) v = +v;                                        // [v2.7] นัดต่อตา / เวลาต่อตา เป็นตัวเลข
     await act('update_settings', { settings: { [k]: v } });
   });
   const randPw = () => String(Math.floor(Math.random() * 10000)).padStart(4, '0');
@@ -988,7 +1003,17 @@
         const board = S.st.settings.mode === 'classic' ? S.tab : '*';
         const i = S.aim.findIndex(x => x.board === board && x.row === r && x.col === c);
         if (i >= 0) S.aim.splice(i, 1);
-        else { if (S.aim.length >= needShots()) S.aim.shift(); S.aim.push({ board, row: r, col: c }); }
+        else {
+          if (S.aim.length >= needShots()) S.aim.shift();
+          // [ใหม่ v2.7] R-7-17 Classic: นัดพื้นฐานต้องคนละกระดาน · เกินสิทธิ์ = เตือนก่อนส่ง
+          if (S.st.settings.mode === 'classic') {
+            const next = [...S.aim, { board, row: r, col: c }];
+            const opp = S.st.players.filter(p => p.alive && !p.removed && p.pid !== S.st.you).length;
+            const need = Math.min(me().shotsBase || 1, opp, next.length);
+            if (new Set(next.map(x => x.board)).size < need) { SFX.play('invalid'); return toast('นัดพื้นฐานต้องยิงคนละกระดาน — สลับไปแท็บคนอื่น'); }
+          }
+          S.aim.push({ board, row: r, col: c });
+        }
         syncAim();
         return render();
       }

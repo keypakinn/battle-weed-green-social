@@ -19,9 +19,10 @@ const CONFIG = Object.freeze({
   },
   PLACE_TIME: 120,          // วินาที
   ISLAND_DRAW_TIME: 60,     // วินาที เพิ่มเมื่อเกาะแบบวาดเอง
-  SHOT_TIME: 15,            // วินาทีต่อนัด / ต่อรอบที่ทุกคนได้ 1 นัด
+  SHOT_TIME: 15,            // วินาทีต่อตา (ค่าเริ่มต้นของ settings.shotTime)
+  SHOT_TIME_CHOICES: [10, 15, 20, 25, 30, 40],   // [ใหม่ v2.7] R-5-21 host เลือกได้
   ROUND_TIME_DOUBLE: 20,    // วินาที รอบที่มีคนได้ 2 นัด (Q78)
-  MAX_SHOTS_PER_ROUND: 2,
+  MAX_SHOTS_PER_ROUND: 12,          // [แก้ v2.7] เพดานรวมนัดต่อรอบ (พื้นฐาน + โบนัส)
   AUTO_SHOT_LIMIT: 3,
   RECONNECT_GRACE: 60,
   ROOM_IDLE_CLOSE: 600,
@@ -82,6 +83,8 @@ const MSG = {
   ALREADY_PLACED: 'ยืนยันการวางไปแล้ว', PLACEMENT_INVALID: 'การวางไม่ถูกต้อง', NOT_YOUR_TURN: 'ยังยิงไม่ได้ตอนนี้',
   OUT_OF_BOUNDS: 'พิกัดอยู่นอกกระดาน', ALREADY_SHOT: 'ช่องนี้ถูกยิงแล้ว', STALE_TURN: 'ตานี้ผ่านไปแล้ว',
   BAD_REQUEST: 'คำสั่งไม่ถูกต้อง', BAD_TOKEN: 'ที่นั่งนี้ใช้ไม่ได้แล้ว', NOT_HOST: 'เฉพาะหัวห้องเท่านั้น',
+  BOARD_REPEAT: 'นัดพื้นฐานต้องยิงคนละกระดาน',   // [ใหม่ v2.7] R-7-17
+  SETTINGS_INVALID: 'ค่าที่ตั้งไม่ถูกต้อง',        // [ใหม่ v2.7]
   NOT_ENOUGH_PLAYERS: 'ต้องมีผู้เล่นอย่างน้อย 2 คน', BAD_TARGET: 'ยิงกระดานนี้ไม่ได้', SHOT_COUNT: 'จำนวนนัดไม่ถูกต้อง',
   ALREADY_SUBMITTED: 'ส่งนัดของรอบนี้แล้ว', DOUBLE_INVALID: 'นัดคู่ต้องยิง 2 ช่องติดกันที่ยังไม่ถูกยิง',
   CARDS_NOT_READY: 'ข้อมูลชิ้นไม่พร้อม',
@@ -134,7 +137,7 @@ class Room {
     this.rand = rand; this.now = now; this.onLog = onLog; this.C = config;
     this.players = []; this.joinSeq = 0;
     this.hostPid = null;
-    this.settings = { mode: 'classic', bonusOnHit: true, islands: 'off', traps: false }; // R-5-01
+    this.settings = { mode: 'classic', bonusOnHit: true, islands: 'off', traps: false, shotsPerTurn: 1, shotTime: 15 }; // R-5-01 · [ใหม่ v2.7] R-5-20, R-5-21
     this.meta = { name: '', private: false, password: null };                          // R-5-09, R-5-10
     this.phase = 'LOBBY'; this.gameNo = 0;
     this.turnStyle = null; this.boardSize = null; this.fleet = [];
@@ -189,7 +192,7 @@ class Room {
   _resetSeat(s) {
     Object.assign(s, {
       ready: false, alive: true, wantsRematch: false, placement: null, pieces: [], islands: [],
-      autoStreak: 0, shotsAllowed: 1, doubleBonus: false, skipNext: false, hitsOnOthers: 0, aim: null,
+      autoStreak: 0, shotsAllowed: 1, shotsBase: 1, bonusShots: 0, doubleBonus: false, skipNext: false, hitsOnOthers: 0, aim: null,
       pending: null, elimAt: null, elimReason: null, shots: 0, hits: 0,
     });
   }
@@ -490,6 +493,16 @@ class Room {
     if ('bonusOnHit' in v) { if (typeof v.bonusOnHit !== 'boolean') throw err('BAD_REQUEST'); n.bonusOnHit = v.bonusOnHit; }
     if ('islands' in v) { if (!['off', 'random', 'draw'].includes(v.islands)) throw err('BAD_REQUEST'); n.islands = v.islands; }
     if ('traps' in v) { if (typeof v.traps !== 'boolean') throw err('BAD_REQUEST'); n.traps = v.traps; }
+    // [ใหม่ v2.7] R-5-20 นัดต่อตา: 1 ถึง MAX_PLAYERS-1 (เพดานจริงตอนเล่นคิดจากคู่แข่งที่ยังอยู่)
+    if ('shotsPerTurn' in v) {
+      if (!isInt(v.shotsPerTurn) || v.shotsPerTurn < 1 || v.shotsPerTurn > this.C.MAX_PLAYERS - 1) throw err('SETTINGS_INVALID');
+      n.shotsPerTurn = v.shotsPerTurn;
+    }
+    // [ใหม่ v2.7] R-5-21 เวลาต่อตา
+    if ('shotTime' in v) {
+      if (!this.C.SHOT_TIME_CHOICES.includes(v.shotTime)) throw err('SETTINGS_INVALID');
+      n.shotTime = v.shotTime;
+    }
     this.settings = n;
     return {};
   }
@@ -565,7 +578,7 @@ class Room {
     if (this.turnStyle === 'turns') {
       this.turnPid = this._firstPid();
       this.turnNo = 1;
-      this.deadline = this.now() + this.C.SHOT_TIME * 1000;
+      this.deadline = this.now() + this._shotMs();
     } else this._beginRound();
   }
   _firstPid() { // R-7-10
@@ -767,7 +780,9 @@ class Room {
       if (!this.roundShooters.has(s.pid)) throw err('NOT_YOUR_TURN');
       if (s.pending) throw err('ALREADY_SUBMITTED');
       if (!Array.isArray(msg.shots) || msg.shots.length !== s.shotsAllowed) throw err('SHOT_COUNT'); // R-7-12
-      s.pending = this._parseShots(s, msg);
+      const parsed = this._parseShots(s, msg);
+      this._checkSpread(s, parsed);                                                                 // [ใหม่ v2.7] R-7-17
+      s.pending = parsed;
       s.autoStreak = 0; s.aim = null;
       if ([...this.roundShooters].every(pid => { const p = this.seat(pid); return !p || !p.alive || p.pending; })) this._resolveRound();
     }
@@ -787,7 +802,7 @@ class Room {
     const max = this.turnStyle === 'turns' ? 1 : s.shotsAllowed;
     if (msg.shots.length > max) throw err('SHOT_COUNT');
     if (!msg.shots.length) { s.aim = null; return {}; }
-    this._parseShots(s, msg);                       // ตรวจเหมือนการยิงจริง
+    this._checkSpread(s, this._parseShots(s, msg));   // ตรวจเหมือนการยิงจริง
     s.aim = msg.shots.map(x => ({ board: x.board, row: x.row, col: x.col, double: x.double }));
     return {};
   }
@@ -834,9 +849,23 @@ class Room {
     if (again && s.alive) {                                                                        // R-10-07 [ใหม่ v2.2]
       this._notice(s.pid, 'big_again', 'โดน! ยิงต่อได้อีกนัด');
       this._others(s.pid, 'again', `${s.name} ได้ยิงต่อ`);
-      this.deadline = this.now() + this.C.SHOT_TIME * 1000; return;
+      this.deadline = this.now() + this._shotMs(); return;
     }
     this._nextTurn(s.pid);
+  }
+  // [ใหม่ v2.7] R-7-17 Classic: นัดพื้นฐานต้องยิงคนละกระดาน (นัดโบนัสยิงซ้ำได้)
+  _checkSpread(s, shots) {
+    if (this.settings.mode !== 'classic') return;
+    const opp = this.alive().filter(p => p.pid !== s.pid).length;
+    const need = Math.min(s.shotsBase || 1, opp, shots.length);
+    if (new Set(shots.map(x => x.board)).size < need) throw err('BOARD_REPEAT');
+  }
+  // [ใหม่ v2.7] R-5-21 เวลาต่อตาตามที่ host ตั้ง
+  _shotMs() { return (this.settings.shotTime || this.C.SHOT_TIME) * 1000; }
+  // [ใหม่ v2.7] R-7-17 นัดพื้นฐาน = min(ค่าที่ตั้ง, คู่แข่งที่ยังอยู่) อย่างน้อย 1
+  _baseShots(s) {
+    const opp = this.alive().filter(p => p.pid !== s.pid).length;
+    return Math.max(1, Math.min(this.settings.shotsPerTurn || 1, opp));
   }
   _others(pid, kind, text) { for (const p of this.active()) if (p.pid !== pid) this._notice(p.pid, kind, text, { pid }); }
   _nextTurn(fromPid) {
@@ -850,7 +879,7 @@ class Room {
       if (p.skipNext) { p.skipNext = false; this._notice('all', 'skip', `${p.name} ถูกข้ามตา`, { pid: p.pid }); continue; } // R-7-62
       this.turnPid = p.pid; break;
     }
-    this.deadline = this.now() + this.C.SHOT_TIME * 1000;
+    this.deadline = this.now() + this._shotMs();
   }
 
   // --- rounds (3+ คน) ---
@@ -864,10 +893,12 @@ class Room {
       if (p.skipNext) { p.skipNext = false; p.skippedRound = this.roundNo; this._notice('all', 'skip', `${p.name} ถูกข้ามรอบนี้`, { pid: p.pid }); continue; }
       this.roundShooters.add(p.pid);
       p.aim = null;
-      if (p.shotsAllowed > 1) { this._notice(p.pid, 'big_two', 'รอบนี้ยิงได้ 2 นัด!'); this._others(p.pid, 'two', `${p.name} ได้ 2 นัดรอบนี้`); } // R-10-07
+      // [แก้ v2.7] R-7-17 นัดพื้นฐานคิดใหม่ทุกรอบ (คู่แข่งตกรอบ = ลดลง) · R-7-18 บวกนัดโบนัสที่ได้จากรอบก่อน
+      p.shotsBase = this._baseShots(p);
+      p.shotsAllowed = Math.min(p.shotsBase + (p.bonusShots || 0), this.C.MAX_SHOTS_PER_ROUND);
+      if (p.bonusShots) { this._notice(p.pid, 'big_two', `รอบนี้ยิงได้ ${p.shotsAllowed} นัด (โบนัส ${p.bonusShots})`); this._others(p.pid, 'two', `${p.name} ได้ ${p.shotsAllowed} นัดรอบนี้`); } // R-10-07
     }
-    const two = [...this.roundShooters].some(pid => this.seat(pid).shotsAllowed > 1);
-    this.deadline = this.now() + (two ? this.C.ROUND_TIME_DOUBLE : this.C.SHOT_TIME) * 1000;       // R-8-03
+    this.deadline = this.now() + this._shotMs();                                                   // R-8-03 · [แก้ v2.7] ใช้เวลาที่ host ตั้ง ไม่ยืดอัตโนมัติแล้ว
   }
   _autoShots(s, count, taken, startIdx = 0) { // R-8-02 / R-8-03 สุ่มช่องที่ยังไม่ถูกยิง
     const out = []; const used = new Set(taken || []);
@@ -919,12 +950,18 @@ class Room {
     const { per, elim } = this._resolve(all);
     // สิทธิ์ 2 นัดรอบหน้า R-7-42, R-7-52, R-7-43
     for (const p of shooters) {
-      let two = false;
+      // [แก้ v2.7] R-7-18 โดนกี่นัด ได้นัดโบนัสรอบหน้าเท่านั้น
+      // Survival นับเฉพาะนัดพื้นฐาน (นัดโบนัสที่โดนไม่ต่อโบนัส) · Classic นับทุกนัด
+      const countAll = this.settings.mode === 'classic';
+      const limit = countAll ? Infinity : (p.shotsBase || 1);
+      let idx = 0, bonus = 0, two = false;
       all.forEach((sh, i) => {
-        if (sh.shooter !== p.pid || sh.auto) return;
-        if ((this.settings.bonusOnHit && per[i].bonusHit) || per[i].islandOther) two = true;
+        if (sh.shooter !== p.pid) return;
+        const n = idx++;
+        if (sh.auto || n >= limit) return;
+        if ((this.settings.bonusOnHit && per[i].bonusHit) || per[i].islandOther) { bonus++; two = true; }
       });
-      p.shotsAllowed = two ? Math.min(2, this.C.MAX_SHOTS_PER_ROUND) : 1;
+      p.bonusShots = Math.min(bonus, this.C.MAX_SHOTS_PER_ROUND - 1);
       if (!two && this.settings.bonusOnHit && all.some((sh, i) => sh.shooter === p.pid && !sh.auto && per[i].ownHit && !per[i].trap))
         this._notice(p.pid, 'own_hit', 'โดนของคุณเอง ไม่ได้ 2 นัดรอบหน้า');                     // R-7-45
       p.pending = null;
@@ -1038,9 +1075,10 @@ class Room {
         ISLAND_MIN_GROUP: C.ISLAND_MIN_GROUP, ANIM_BULLET_MS: C.ANIM_BULLET_MS, ANIM_EFFECT_MS: C.ANIM_EFFECT_MS,
         SUNK_REVEAL_MS: C.SUNK_REVEAL_MS, MIN_PLAYERS: C.MIN_PLAYERS, MAX_PLAYERS: C.MAX_PLAYERS,
         COUNTDOWN_FROM: C.COUNTDOWN_FROM, TURN_BANNER_MS: C.TURN_BANNER_MS, CHAT_MAX: C.CHAT_MAX,
+        SHOT_TIME_CHOICES: C.SHOT_TIME_CHOICES, MAX_SHOTS_PER_ROUND: C.MAX_SHOTS_PER_ROUND,   // [ใหม่ v2.7]
       },
       players: this.players.filter(p => !p.removed || reveal).map(p => ({
-        pid: p.pid, name: p.name, color: p.color, connected: p.connected, ready: p.ready, alive: p.alive,
+        pid: p.pid, name: p.name, color: p.color, connected: p.connected, ready: p.ready, alive: p.alive, shotsBase: p.shotsBase,
         removed: !!p.removed, wantsRematch: p.wantsRematch, autoStreak: p.autoStreak,
         shotsAllowed: p.shotsAllowed, doubleBonus: p.doubleBonus, skipNext: p.skipNext,
         submitted: this.turnStyle === 'rounds' && this.phase === 'BATTLE' ? !!p.pending : false,

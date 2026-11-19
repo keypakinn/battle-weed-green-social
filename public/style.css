@@ -212,7 +212,9 @@ html.noscroll,html.noscroll body{height:100dvh;overflow:hidden}
 .fhint .dblctl{display:flex;align-items:center;gap:6px}
 .inv{visibility:hidden}
 /* [ใหม่ v2.6] R-7-15 ช่องที่ถูกยิงติดสีของคนยิง */
+/* [แก้ v2.7 D-67] ช่องที่ยิงพลาด = เหลือแค่จุดสี ไม่ระบายพื้น · ช่องที่โดนยังมีพื้นสีจาง */
 .cell.shotby::after{content:'';position:absolute;inset:0;background:var(--sc);opacity:.17;pointer-events:none}
+.cell.s-miss.shotby::after{display:none}
 .cell.s-hit.shotby::after,.cell.s-island_hit.shotby::after{opacity:.32}
 .cell.s-miss{color:#D5DED8}
 .cell.s-hit,.cell.s-island_hit{color:#F07A2A}
@@ -220,3 +222,4 @@ html.noscroll,html.noscroll body{height:100dvh;overflow:hidden}
 .cell .mk{position:relative;z-index:1}
 .vtag{opacity:.55;margin-top:14px}
 @media (max-height:760px){.legend{display:none}.fhint{min-height:0}.fhint .muted{display:none}.status.lock2 .srow2{min-height:0;font-size:12px;line-height:16px}}
+.optgrp .opt.off{opacity:.35}
